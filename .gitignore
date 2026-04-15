@@ -1,0 +1,65 @@
+# Environment — NEVER commit credentials
+.env
+*.env
+.env.*
+!.env.example
+
+# AWS credentials — belt-and-suspenders
+*credentials*
+aws_credentials
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Raw data — never commit CSVs
+data/raw/*.csv
+data/raw/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Airflow
+airflow.db
+airflow.cfg
+logs/
+airflow/logs/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Astro CLI
+.astro/
+
+# Build artefacts
+food_waste_360.zip
+*.zip
+
+# Session logs and scratch files — contain sensitive run-time data
+docs/session_chat_log.md
+
+# Generated data
+data/silver/
+data/gold/
