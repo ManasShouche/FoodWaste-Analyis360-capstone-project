@@ -1,0 +1,2 @@
+# Airflow provider for AWS — enables GlueJobOperator and aws_default connection
+apache-airflow-providers-amazon==8.19.0
