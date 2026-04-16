@@ -2,6 +2,10 @@
 Food Waste Optimization 360 — Streamlit Dashboard Entry Point
 """
 
+import os
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
 import streamlit as st
 
 st.set_page_config(
