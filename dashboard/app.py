@@ -1,6 +1,4 @@
-"""
-Food Waste Optimization 360 — Streamlit Dashboard Entry Point
-"""
+
 
 import os
 from dotenv import load_dotenv
@@ -10,7 +8,7 @@ import streamlit as st
 
 st.set_page_config(
     page_title="Food Waste Optimization 360",
-    page_icon="♻️",
+    page_icon="",
     layout="wide",
 )
 

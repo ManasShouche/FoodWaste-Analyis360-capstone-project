@@ -1,15 +1,10 @@
-"""
-Athena connection helper — Food Waste Optimization 360
-Returns a PyAthena connection using environment variables only.
-Never hardcode credentials here.
-"""
 
 import os
 from pyathena import connect
 
 
 def get_connection():
-    """Return a PyAthena connection configured from environment variables."""
+
     aws_region          = os.environ.get("AWS_REGION", "ap-south-1")
     athena_results_bucket = os.environ.get("ATHENA_RESULTS_BUCKET")
     athena_database     = os.environ.get("ATHENA_DATABASE", "food_waste_db")
