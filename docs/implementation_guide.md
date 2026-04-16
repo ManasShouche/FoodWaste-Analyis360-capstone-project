@@ -1,1580 +1,690 @@
 # Implementation Guide — Food Waste Optimization 360
 
-A complete technical reference covering every component of the pipeline: data generation, Bronze/Silver/Gold layers, star schema warehouse, Athena analytics, Airflow orchestration, Streamlit dashboard, and testing.
+A narrative technical reference explaining how every component of the pipeline works, why it was built the way it was, and how the pieces connect.
 
 ---
 
 ## Table of Contents
 
-1. [Project Overview](#1-project-overview)
-2. [Repository Layout](#2-repository-layout)
-3. [Environment Setup](#3-environment-setup)
-4. [Data Generation](#4-data-generation)
-5. [Bronze Layer — Ingestion](#5-bronze-layer--ingestion)
-6. [Silver Layer — Transform](#6-silver-layer--transform)
-7. [Quality Checks — Shared DQ Gate](#7-quality-checks--shared-dq-gate)
-8. [Gold Layer — Dimension Loaders](#8-gold-layer--dimension-loaders)
-9. [Gold Layer — SCD2 Supplier Dimension](#9-gold-layer--scd2-supplier-dimension)
-10. [Gold Layer — Fact Loaders](#10-gold-layer--fact-loaders)
-11. [Athena Analytics](#11-athena-analytics)
-12. [Root Cause Classification View](#12-root-cause-classification-view)
-13. [Airflow Orchestration](#13-airflow-orchestration)
-14. [AWS Infrastructure Setup](#14-aws-infrastructure-setup)
-15. [CI/CD — GitHub Actions](#15-cicd--github-actions)
-16. [Test Suite](#16-test-suite)
-17. [Dashboard](#17-dashboard)
-18. [Makefile Commands](#18-makefile-commands)
-19. [Cost Profile](#19-cost-profile)
-20. [Known Bugs Fixed](#20-known-bugs-fixed)
+1. [What This Project Does](#1-what-this-project-does)
+2. [End-to-End Data Flow](#2-end-to-end-data-flow)
+3. [Data Sources](#3-data-sources)
+4. [Bronze Layer — Raw Ingestion](#4-bronze-layer--raw-ingestion)
+5. [Silver Layer — Clean and Join](#5-silver-layer--clean-and-join)
+6. [Data Quality Gates](#6-data-quality-gates)
+7. [Gold Layer — Dimensional Model](#7-gold-layer--dimensional-model)
+8. [SCD2 — Supplier History](#8-scd2--supplier-history)
+9. [Fact Tables](#9-fact-tables)
+10. [Athena Analytics](#10-athena-analytics)
+11. [Root Cause Classification](#11-root-cause-classification)
+12. [Airflow Orchestration](#12-airflow-orchestration)
+13. [Testing Strategy](#13-testing-strategy)
+14. [CI/CD Pipeline](#14-cicd-pipeline)
+15. [Dashboard](#15-dashboard)
+16. [AWS Infrastructure](#16-aws-infrastructure)
+17. [Known Bugs Fixed](#17-known-bugs-fixed)
 
 ---
 
-## 1. Project Overview
+## 1. What This Project Does
 
-**Food Waste Optimization 360** is a batch data engineering platform that ingests synthetic kitchen operational data, processes it through a medallion architecture (Bronze → Silver → Gold), models a star schema warehouse, and surfaces waste insights via Athena SQL and a Streamlit dashboard.
+Food Waste Optimization 360 is a **batch data engineering pipeline** that answers one central business question: *where, when, and why is food being wasted across kitchen locations?*
 
-### High-Level Data Flow
+It ingests five synthetic CSV files representing a year of kitchen operations, processes them through a three-layer medallion architecture on AWS, models a star schema data warehouse, and surfaces the results through SQL analytics and a Streamlit dashboard.
 
-```
-[5 CSV Sources — Synthetic]
-  macro_production_logs.csv   (10,000 rows)
-  macro_waste_logs.csv         (6,000 rows)
-  macro_menu_data.csv            (200 rows)
-  macro_location_data.csv         (20 rows)
-  macro_supplier_data.csv         (~68 rows)
-         │
-         ▼  ingestion/bronze_loader.py  (boto3 + pandas — Glue Python shell)
-[S3 Bronze Layer]
-  s3://bucket/bronze/source={name}/date={YYYY-MM-DD}/data.parquet
-         │
-         ▼  transforms/silver_transform.py  (PySpark — Glue Spark job)
-[S3 Silver Layer]
-  s3://bucket/silver/year={Y}/month={M}/
-         │
-         ├──▶ warehouse/dim_loaders.py     (pandas — Glue Python shell)
-         ├──▶ warehouse/scd2_supplier.py   (pandas — reads Bronze directly)
-         └──▶ warehouse/fact_loaders.py    (pandas)
-                    │
-                    ▼
-[S3 Gold Layer — Star Schema]
-  s3://bucket/gold/dims/{dim_name}/data.parquet
-  s3://bucket/gold/facts/{fact_name}/data.parquet
-         │
-         ▼  AWS Athena (food_waste_db — external Parquet tables)
-[Analytics Layer]
-  5 analytical queries + waste_root_cause view
-         │
-         ▼  Streamlit (PyAthena)
-[Dashboard — 5 pages]
-```
-
-### Technology Stack
-
-| Layer | Technology |
-|-------|-----------|
-| Compute | AWS Glue (Python shell + Spark) |
-| Storage | AWS S3 (Parquet) |
-| Warehouse | AWS Athena (external tables) |
-| Orchestration | Apache Airflow via Astro CLI (local Docker) |
-| Dashboard | Streamlit + PyAthena |
-| Testing | pytest + PySpark (in-memory) |
-| CI/CD | GitHub Actions |
+The platform is entirely **serverless** — AWS Glue handles compute, S3 handles storage, and Athena handles querying. There is zero idle cost between pipeline runs.
 
 ---
 
-## 2. Repository Layout
+## 2. End-to-End Data Flow
+
+### Pipeline Overview
 
 ```
-food-waste-360/
-├── ingestion/
-│   ├── data_generator.py        # Faker-based CSV generation
-│   └── bronze_loader.py         # S3 upload + Parquet conversion
-├── transforms/
-│   ├── silver_transform.py      # PySpark Silver job
-│   └── quality_checks.py        # Shared DQ gate (Silver + Gold)
-├── warehouse/
-│   ├── dim_loaders.py           # 6 SCD1 + static dims
-│   ├── scd2_supplier.py         # DIM_SUPPLIER SCD2 logic
-│   └── fact_loaders.py          # 4 fact tables
-├── analytics/
-│   ├── athena_queries.sql        # 5 core analytical queries
-│   └── root_cause_view.sql       # Root cause classification view
-├── orchestration/
-│   └── dags/
-│       └── food_waste_pipeline.py
-├── aws_setup/
-│   ├── 01_s3_setup.py
-│   └── 02_iam_setup.py
-├── tests/
-│   ├── test_quality_checks.py
-│   ├── test_silver_transforms.py
-│   └── test_scd2.py
-├── docs/
-│   ├── architecture.md
-│   ├── data_dictionary.md
-│   └── implementation_guide.md   ← this file
-├── data/raw/                     # local CSV output from data_generator.py
-├── .github/workflows/pipeline_tests.yml
-├── .env.example
-├── .gitignore
-├── requirements.txt
-├── Makefile
-└── setup_aws.py
+┌──────────────────────────────────────────────────────────┐
+│                    SOURCE LAYER (local)                  │
+│  5 CSV files generated by data_generator.py (Faker)      │
+└───────────────────────┬──────────────────────────────────┘
+                        │  ingestion/bronze_loader.py
+                        │  (pandas + boto3 — Glue Python shell)
+                        ▼
+┌──────────────────────────────────────────────────────────┐
+│                    BRONZE LAYER (S3)                     │
+│  Parquet files, one per source per day                   │
+│  + metadata: ingestion_timestamp, batch_id, source_file  │
+└───────────────────────┬──────────────────────────────────┘
+                        │  transforms/silver_transform.py
+                        │  (PySpark — Glue Spark job, 2×G.1X)
+                        ▼
+┌──────────────────────────────────────────────────────────┐
+│                    SILVER LAYER (S3)                     │
+│  Cleaned, joined, derived columns                        │
+│  Partitioned by year / month (idempotent overwrite)      │
+└──────┬───────────────────────────────────────────────────┘
+       │                        │
+       │  dim_loaders.py        │  fact_loaders.py
+       │  scd2_supplier.py      │  (pandas — Glue Python shell)
+       ▼                        ▼
+┌──────────────────────────────────────────────────────────┐
+│                    GOLD LAYER (S3)                       │
+│  Star schema: 7 dimension tables + 4 fact tables         │
+└───────────────────────┬──────────────────────────────────┘
+                        │  Athena external tables
+                        ▼
+┌──────────────────────────────────────────────────────────┐
+│                    ANALYTICS (Athena)                    │
+│  food_waste_db — 5 SQL queries + root cause view         │
+└───────────────────────┬──────────────────────────────────┘
+                        │  PyAthena
+                        ▼
+┌──────────────────────────────────────────────────────────┐
+│                    DASHBOARD (Streamlit)                 │
+│  5 pages — Overview, Location, Category, Trends,         │
+│  Root Cause                                              │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Orchestration
+
+All three Glue jobs are wired in sequence by an Airflow DAG triggered manually:
+
+```
+[Airflow DAG: food_waste_pipeline]
+
+  bronze_ingestion  ──▶  silver_transform  ──▶  gold_load
+  (Glue Python shell)   (Glue Spark job)    (Glue Python shell)
+
+  If any job fails → DAG halts, downstream tasks do not run.
 ```
 
 ---
 
-## 3. Environment Setup
+## 3. Data Sources
 
-### Required environment variables
+Five synthetic CSV files are generated by `ingestion/data_generator.py` using the **Faker** library with Indian locale (`en_IN`) and a fixed random seed for reproducibility.
 
-Copy `.env.example` to `.env` and fill in values. **Never commit `.env` to git.**
+### Files and their purpose
 
-```bash
-AWS_ACCESS_KEY_ID=
-AWS_SECRET_ACCESS_KEY=
-AWS_REGION=ap-south-1
-S3_BUCKET=food-waste-360-596234624522
-ATHENA_RESULTS_BUCKET=food-waste-360-596234624522-athena-results
-ATHENA_DATABASE=food_waste_db
+| File | Rows | Role in pipeline |
+|------|------|-----------------|
+| `macro_production_logs.csv` | ~10,000 | Core operational fact — what was prepared, when, where |
+| `macro_waste_logs.csv` | ~6,000 | Waste events — what was wasted and why |
+| `macro_menu_data.csv` | 200 | Reference dimension — menu item attributes |
+| `macro_location_data.csv` | 20 | Reference dimension — kitchen location details |
+| `macro_supplier_data.csv` | ~68 | SCD2-style supplier records with history |
+
+### Referential integrity at generation time
+
+The generator builds files in dependency order so all foreign keys are valid from the start:
+
+```
+1. Locations are generated first  (LOC001 – LOC020)
+2. Menu items are generated next  (MI0001 – MI0200)
+3. Suppliers are built from menu IDs — each covers 3–8 items
+4. Production logs are sampled from locations × menu × dates × meal periods
+5. Waste logs are sampled from actual production rows
+   → guarantees waste_quantity ≤ prepared_quantity for every row
 ```
 
-All Python files load credentials exclusively via `os.environ.get()` — no hardcoded values anywhere.
+The critical constraint — that waste never exceeds what was prepared — is enforced by capping waste at 45% of the prepared quantity when sampling. After generation, the script runs two self-checks: orphan waste rows (waste events with no matching production row) and waste > prepared violations. Both should be zero.
 
-### AWS resources (already provisioned)
+### Date range and configuration
 
-| Resource | Value |
-|----------|-------|
-| S3 bucket | `food-waste-360-596234624522` |
-| Athena results bucket | `food-waste-360-596234624522-athena-results` |
-| IAM role | `FoodWasteGlueRole` |
-| Glue job — Bronze | `food_waste_bronze` |
-| Glue job — Silver | `food_waste_silver` |
-| Glue job — Gold | `food_waste_gold` |
-| Athena workgroup | `food-waste-wg` (1 GB scan limit) |
-| Athena database | `food_waste_db` |
-| Region | `ap-south-1` (Mumbai) |
+All production and waste events span the full calendar year **2025-01-01 to 2025-12-31**, across four meal periods (Breakfast, Lunch, Dinner, Snack) and nine food categories (Main Course, Starter, Dessert, Beverage, Salads, Dairy, Fresh Juice, Snacks, Breads).
 
 ---
 
-## 4. Data Generation
+## 4. Bronze Layer — Raw Ingestion
 
-**File:** [ingestion/data_generator.py](../ingestion/data_generator.py)
+**Script:** `ingestion/bronze_loader.py`
+**Glue job:** `food_waste_bronze` (Python shell, 0.0625 DPU — cheapest Glue tier)
 
-Generates five referentially consistent synthetic CSV files using **Faker** (Indian locale `en_IN`) with a fixed seed (`random.seed(42)`, `Faker.seed(42)`) for reproducibility.
+### Purpose
 
-### Generation order and referential integrity
+The Bronze layer's only job is to get raw data onto S3 as Parquet, cleanly, with audit metadata attached. No business logic is applied here — that belongs to Silver.
 
-```
-1. generate_location_data()   →  20 locations (LOC001–LOC020)
-2. generate_menu_data()       →  200 menu items (MI0001–MI0200)
-3. generate_supplier_data()   →  ~68 rows (10 suppliers × 3-8 items + ~30% SCD2 history rows)
-4. generate_production_logs() →  10,000 rows sampled from locations × menu × dates × meal_periods
-5. generate_waste_logs()      →  6,000 rows sampled from production rows (waste ≤ prepared enforced)
-```
+### What happens per source file
 
-**Key constraint enforced at generation time:**
+1. CSV is read with all columns treated as strings (no type-casting yet — that is Silver's responsibility)
+2. Whitespace is stripped from all string columns
+3. A hard-stop DQ gate validates that the file is non-empty and that primary key columns contain no nulls
+4. Three metadata columns are added: `ingestion_timestamp` (UTC ISO string), `source_file` (original filename), and `batch_id` (a single UUID shared across all 5 files in the same run — allows tracing all Bronze files from one pipeline execution)
+5. The DataFrame is serialised to Parquet in-memory and uploaded to S3
 
-```python
-# Waste logs are always sampled from actual production rows
-sampled = prod_df.sample(n=min(n_rows, len(prod_df)), replace=False)
-for _, prod_row in sampled.iterrows():
-    max_waste = prod_row["quantity_prepared"]
-    waste_qty = round(random.uniform(1.0, max_waste * 0.45), 1)  # max 45% waste
-```
-
-### Configuration constants
-
-```python
-DATE_START    = date(2025, 1, 1)
-DATE_END      = date(2025, 12, 31)
-MEAL_PERIODS  = ["Breakfast", "Lunch", "Dinner", "Snack"]
-WASTE_REASONS = ["overproduction", "spoilage", "low demand",
-                 "forecast miss", "prep error", "plate waste"]
-CATEGORIES    = ["Main Course", "Starter", "Dessert", "Beverage",
-                 "Salads", "Dairy", "Fresh Juice", "Snacks", "Breads"]
-```
-
-### Post-generation integrity checks
-
-After generating all files, the script runs two self-validation checks and prints results:
-
-```python
-# Check 1: No orphan waste rows (all waste keys exist in production)
-orphan_waste = waste_keys - prod_keys
-
-# Check 2: No waste > prepared violations
-merged = waste_df.merge(prod_df[...], on=[...], how="left")
-violations = (merged["quantity_wasted"] > merged["quantity_prepared"]).sum()
-```
-
-### Running the generator
-
-```bash
-# Default (10,000 production / 6,000 waste)
-python ingestion/data_generator.py
-
-# Custom row counts
-python ingestion/data_generator.py --rows-production 5000 --rows-waste 3000
-```
-
-Output goes to `data/raw/` by default (configurable via `DATA_DIR` env var).
-
----
-
-## 5. Bronze Layer — Ingestion
-
-**File:** [ingestion/bronze_loader.py](../ingestion/bronze_loader.py)
-**Glue job:** `food_waste_bronze` (Python shell, 0.0625 DPU)
-
-### What it does
-
-1. Reads each `macro_*.csv` from local `data/raw/` (dev) or `s3://bucket/raw/` (production)
-2. Strips whitespace from all string columns
-3. Runs a hard-stop DQ gate (row count + primary key nulls)
-4. Adds three metadata columns to every row
-5. Serialises to Parquet in-memory and uploads to S3
-
-### Source map
-
-```python
-SOURCES = {
-    "production_logs": {
-        "file": "macro_production_logs.csv",
-        "pk": ["date", "location_id", "menu_item_id", "meal_period"],
-    },
-    "waste_logs": {
-        "file": "macro_waste_logs.csv",
-        "pk": ["date", "location_id", "menu_item_id", "meal_period"],
-    },
-    "menu_data":      {"file": "macro_menu_data.csv",     "pk": ["menu_item_id"]},
-    "location_data":  {"file": "macro_location_data.csv", "pk": ["location_id"]},
-    "supplier_data":  {"file": "macro_supplier_data.csv", "pk": ["supplier_record_id"]},
-}
-```
-
-### DQ gate (pandas)
-
-```python
-def run_bronze_dq(df: pd.DataFrame, source_name: str, pk_cols: list[str]) -> None:
-    if len(df) == 0:
-        raise ValueError(f"DQ GATE FAILED [{source_name}]: DataFrame is empty.")
-    for col in pk_cols:
-        null_count = df[col].isnull().sum()
-        if null_count > 0:
-            raise ValueError(
-                f"DQ GATE FAILED [{source_name}]: PK column '{col}' has {null_count} null values."
-            )
-```
-
-### Metadata columns added
-
-| Column | Value |
-|--------|-------|
-| `ingestion_timestamp` | UTC ISO string at time of run |
-| `source_file` | Original CSV filename |
-| `batch_id` | UUID shared across all 5 files in one run |
-
-### S3 output structure
+### S3 path structure
 
 ```
 s3://food-waste-360-596234624522/bronze/
-  source=production_logs/date=2025-01-15/data.parquet
-  source=waste_logs/date=2025-01-15/data.parquet
-  source=menu_data/date=2025-01-15/data.parquet
-  source=location_data/date=2025-01-15/data.parquet
-  source=supplier_data/date=2025-01-15/data.parquet
+  source=production_logs / date=2025-04-15 / data.parquet
+  source=waste_logs      / date=2025-04-15 / data.parquet
+  source=menu_data       / date=2025-04-15 / data.parquet
+  source=location_data   / date=2025-04-15 / data.parquet
+  source=supplier_data   / date=2025-04-15 / data.parquet
 ```
 
-### CSV reader (local vs S3)
+The `source=` and `date=` segments are Hive-style partition prefixes. Athena can filter on them without scanning the full bucket.
 
-```python
-def _read_csv(data_dir: str, filename: str) -> pd.DataFrame:
-    if data_dir.startswith("s3://"):
-        s3_path = data_dir.rstrip("/") + "/" + filename
-        bucket, key = s3_path[5:].split("/", 1)
-        resp = boto3.client("s3", region_name=AWS_REGION).get_object(Bucket=bucket, Key=key)
-        return pd.read_csv(io.BytesIO(resp["Body"].read()), dtype=str)
-    else:
-        return pd.read_csv(os.path.join(data_dir, filename), dtype=str)
-```
+### DQ gate behaviour
 
-All CSVs are read as `dtype=str` to preserve raw values before type-casting occurs in Silver.
+If any file fails the DQ gate (empty file or null primary keys), the script raises a `ValueError` immediately. Because Glue propagates the exception as a job failure, Airflow marks `bronze_ingestion` as FAILED and `silver_transform` never starts. This is intentional — there is no point transforming corrupt data.
 
 ---
 
-## 6. Silver Layer — Transform
+## 5. Silver Layer — Clean and Join
 
-**File:** [transforms/silver_transform.py](../transforms/silver_transform.py)
-**Glue job:** `food_waste_silver` (Spark, 2 × G.1X workers)
+**Script:** `transforms/silver_transform.py`
+**Glue job:** `food_waste_silver` (Spark, 2 × G.1X workers — the only job that needs distributed compute)
 
-### Overview
+### Purpose
 
-The Silver job reads all four operational sources from Bronze, cleans and type-casts each DataFrame, joins them, computes four derived analytical columns, runs 10 DQ checks, then writes partitioned Parquet (idempotent).
+Silver is where all four operational sources (production, waste, menu, location) are cleaned, type-cast, joined, and enriched with four derived analytical columns. The result is a single wide table partitioned by year and month.
 
-Supplier data is **not** included in Silver — it is loaded directly from Bronze to Gold via SCD2.
+Supplier data is deliberately excluded from Silver — it flows separately from Bronze straight to Gold via the SCD2 loader.
 
-### SparkSession config
+### Cleaning — what happens to each source
 
-```python
-def get_spark() -> SparkSession:
-    return (
-        SparkSession.builder.appName("FoodWaste_SilverTransform")
-        .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
-        .getOrCreate()
-    )
-```
+Each source has its own cleaning function that applies appropriate type casts and string normalisation:
 
-The `dynamic` partition overwrite mode is critical for idempotency — only the partitions being written are replaced, not the entire table.
+- **Production** — date string → DateType, numeric columns → DoubleType, meal_period lowercased
+- **Waste** — same date and numeric casts, waste_reason stripped and lowercased
+- **Menu** — category UPPERCASED (so it matches consistently across all layers), numeric casts
+- **Location** — string trimming + deduplication on `location_id` (defensive, should be unique)
 
-### Cleaning functions
-
-#### `clean_production(df)`
-
-```python
-def clean_production(df: DataFrame) -> DataFrame:
-    return (
-        df.withColumn("date", F.to_date(F.col("date"), "yyyy-MM-dd").cast(DateType()))
-        .withColumn("quantity_prepared",      F.col("quantity_prepared").cast(DoubleType()))
-        .withColumn("cost_per_unit",          F.col("cost_per_unit").cast(DoubleType()))
-        .withColumn("planned_quantity",       F.col("planned_quantity").cast(DoubleType()))
-        .withColumn("actual_served_estimate", F.col("actual_served_estimate").cast(DoubleType()))
-        .withColumn("location_id",  F.trim(F.col("location_id")))
-        .withColumn("menu_item_id", F.trim(F.col("menu_item_id")))
-        .withColumn("meal_period",  F.trim(F.lower(F.col("meal_period"))))
-        .withColumn("category",     F.trim(F.col("category")))
-    )
-```
-
-#### `clean_waste(df)`
-
-```python
-def clean_waste(df: DataFrame) -> DataFrame:
-    return (
-        df.withColumn("date",             F.to_date(F.col("date"), "yyyy-MM-dd").cast(DateType()))
-        .withColumn("quantity_wasted",    F.col("quantity_wasted").cast(DoubleType()))
-        .withColumn("location_id",        F.trim(F.col("location_id")))
-        .withColumn("menu_item_id",       F.trim(F.col("menu_item_id")))
-        .withColumn("meal_period",        F.trim(F.lower(F.col("meal_period"))))
-        .withColumn("waste_reason",       F.trim(F.lower(F.col("waste_reason"))))
-        .withColumn("waste_stage",        F.trim(F.col("waste_stage")))
-    )
-```
-
-#### `clean_menu(df)`
-
-```python
-def clean_menu(df: DataFrame) -> DataFrame:
-    return (
-        df.withColumn("menu_item_id",    F.trim(F.col("menu_item_id")))
-        .withColumn("menu_item_name",    F.trim(F.col("menu_item_name")))
-        .withColumn("category",          F.upper(F.trim(F.col("category"))))   # UPPERCASED
-        .withColumn("sub_category",      F.trim(F.col("sub_category")))
-        .withColumn("cost_per_unit",     F.col("cost_per_unit").cast(DoubleType()))
-        .withColumn("shelf_life_hours",  F.col("shelf_life_hours").cast(IntegerType()))
-    )
-```
-
-#### `clean_location(df)`
-
-```python
-def clean_location(df: DataFrame) -> DataFrame:
-    return (
-        df.withColumn("location_id",   F.trim(F.col("location_id")))
-        .withColumn("location_name",   F.trim(F.col("location_name")))
-        .withColumn("city",            F.trim(F.col("city")))
-        .withColumn("region",          F.trim(F.col("region")))
-        .dropDuplicates(["location_id"])   # defensive dedup
-    )
-```
+All string normalisation happens here so Gold layers receive clean, consistent values.
 
 ### Join strategy
 
-```python
-def build_silver(prod_df, waste_df, menu_df, loc_df) -> DataFrame:
-    # Step 1: aggregate waste to production grain (many-waste:one-production)
-    waste_agg = waste_df.groupBy(
-        "date", "location_id", "menu_item_id", "meal_period"
-    ).agg(
-        F.sum("quantity_wasted").alias("quantity_wasted"),
-        F.first("waste_reason").alias("waste_reason"),
-        F.first("waste_stage").alias("waste_stage"),
-    )
-
-    # Step 2: menu — drop cost_per_unit to avoid duplicate column error
-    # (production already carries cost_per_unit as a denormalised column)
-    menu_dedup = menu_df.dropDuplicates(["menu_item_id"]).select(
-        "menu_item_id", "sub_category", "veg_flag", "shelf_life_hours", "prep_complexity",
-    )
-
-    # Step 3: location — drop location_name (already in production)
-    loc_dedup = loc_df.select(
-        "location_id", "city", "region", "location_type", "capacity", "storage_rating",
-    )
-
-    # Step 4: join chain
-    silver = (
-        prod_df
-        .join(waste_agg, on=["date","location_id","menu_item_id","meal_period"], how="left")
-        .join(menu_dedup, on="menu_item_id", how="left")
-        .join(loc_dedup,  on="location_id",  how="left")
-    )
+```
+production  ──LEFT JOIN──▶  waste_aggregated
+                │             (aggregated to production grain first:
+                │              date + location_id + menu_item_id + meal_period)
+                │
+            ──LEFT JOIN──▶  menu_dedup
+                │             (distinct on menu_item_id; cost_per_unit excluded
+                │              because production already carries it — keeping both
+                │              caused an ambiguous column reference bug)
+                │
+            ──LEFT JOIN──▶  location
+                              (location_name excluded — already in production)
 ```
 
-**Why LEFT joins:** Not every production row has a corresponding waste event. LEFT join preserves all production rows; waste columns default to `null` and are coalesced to `0.0`.
+Left joins are used throughout because not every production row has a corresponding waste event. Rows with no waste get `quantity_wasted` coalesced to 0.0, which flows through correctly to all downstream derived columns.
 
 ### Derived columns
 
-```python
-# Coalesce waste to 0 where no waste record exists
-silver = silver.withColumn(
-    "quantity_wasted", F.coalesce(F.col("quantity_wasted"), F.lit(0.0))
-)
+Four analytical columns are computed here and carried into Gold:
 
-# Four analytical columns
-silver = (
-    silver
-    .withColumn("waste_percentage",
-        F.when(F.col("quantity_prepared") > 0,
-               (F.col("quantity_wasted") / F.col("quantity_prepared")) * 100
-        ).otherwise(F.lit(0.0))
-    )
-    .withColumn("waste_cost",
-        F.col("quantity_wasted") * F.col("cost_per_unit")
-    )
-    .withColumn("quantity_consumed",
-        F.col("quantity_prepared") - F.col("quantity_wasted")
-    )
-    .withColumn("demand_gap",
-        F.col("planned_quantity") - F.col("actual_served_estimate")
-    )
-    # Partition columns
-    .withColumn("year",  F.year(F.col("date")))
-    .withColumn("month", F.month(F.col("date")))
-)
-```
+| Column | What it means |
+|--------|--------------|
+| `waste_percentage` | What fraction of the batch was wasted (0–100%) |
+| `waste_cost` | INR cost of the wasted food |
+| `quantity_consumed` | What was actually served (prepared minus wasted) |
+| `demand_gap` | How far off the forecast was (planned minus actual served) |
 
-| Column | Formula | Meaning |
-|--------|---------|---------|
-| `waste_percentage` | `(wasted / prepared) * 100` | % of prepared batch that was wasted |
-| `waste_cost` | `wasted * cost_per_unit` | INR cost of wasted food |
-| `quantity_consumed` | `prepared - wasted` | Actual food served/consumed |
-| `demand_gap` | `planned - actual_served` | Over/under-production vs forecast |
+### Idempotency
 
-### Silver DQ checks (10 hard stops)
-
-```python
-VALID_WASTE_REASONS = ["overproduction", "spoilage", "low demand", "plate waste",
-                       "forecast miss", "prep error", None]
-
-def silver_dq_checks(df):
-    return [
-        ("waste_lte_prepared",      F.col("quantity_wasted") <= F.col("quantity_prepared")),
-        ("waste_pct_0_to_100",      F.col("waste_percentage").between(0, 100)),
-        ("location_id_not_null",    F.col("location_id").isNotNull()),
-        ("menu_item_id_not_null",   F.col("menu_item_id").isNotNull()),
-        ("date_not_null",           F.col("date").isNotNull()),
-        ("valid_waste_reason",      valid_reasons_col),
-        ("waste_cost_gte_0",        F.col("waste_cost") >= 0),
-        ("quantity_consumed_gte_0", F.col("quantity_consumed") >= 0),
-        ("quantity_prepared_gt_0",  F.col("quantity_prepared") > 0),
-        ("waste_pct_not_null",      F.col("waste_percentage").isNotNull()),
-    ]
-```
-
-### Write pattern (idempotent)
-
-```python
-out_path = f"s3://{S3_BUCKET}/silver/"
-(
-    silver.write
-    .mode("overwrite")
-    .partitionBy("year", "month")
-    .parquet(out_path)
-)
-```
-
-With `spark.sql.sources.partitionOverwriteMode=dynamic`, re-running for the same year/month replaces only that partition — no duplicates are created.
+The write uses `mode("overwrite")` with `partitionBy("year", "month")` and Spark's `partitionOverwriteMode=dynamic`. This means re-running the Silver job for January 2025 replaces only the January partition — it does not touch any other month and does not create duplicates. This is the key property that makes the pipeline safe to re-run.
 
 ---
 
-## 7. Quality Checks — Shared DQ Gate
+## 6. Data Quality Gates
 
-**File:** [transforms/quality_checks.py](../transforms/quality_checks.py)
+**Script:** `transforms/quality_checks.py`
 
-A single shared utility used by both Silver and Gold layers.
+### Design philosophy
 
-```python
-def run_dq_gate(df: DataFrame, checks: list[tuple[str, Column]]) -> None:
-    """
-    Hard-stop DQ gate for PySpark DataFrames.
-    Each condition evaluates True for VALID rows.
-    Raises ValueError if any check finds failing rows.
-    """
-    for check_name, condition in checks:
-        failing = df.filter(~condition).count()
-        if failing > 0:
-            raise ValueError(f"DQ GATE FAILED: {check_name} — {failing} rows")
-        logger.info("DQ PASSED: %s", check_name)
-        print(f"  DQ PASSED: {check_name}")
-```
+DQ checks in this pipeline are not warnings or logs — they are **hard stops**. When a check fails, a `ValueError` is raised, the Glue job exits as FAILED, and Airflow blocks all downstream tasks. Bad data never reaches the next layer.
 
-**Design principle:** DQ checks are not warnings — they are hard stops. If `run_dq_gate` raises, Airflow marks the task as FAILED and all downstream tasks are blocked.
+### How it works
 
-**Usage pattern:**
+The shared `run_dq_gate()` function accepts a list of `(check_name, spark_column_condition)` tuples. Each condition defines what a **valid** row looks like. The function counts how many rows violate each condition — if any fail, it raises immediately with the check name and failure count.
 
-```python
-# Before writing any layer:
-run_dq_gate(silver_df, silver_dq_checks(silver_df))
-```
+### Silver's 10 DQ checks
+
+These run after the Silver join is built, before writing to S3:
+
+| Check | What it catches |
+|-------|----------------|
+| `waste_lte_prepared` | Waste exceeding what was prepared — data integrity violation |
+| `waste_pct_0_to_100` | Percentage outside valid range — calculation error |
+| `location_id_not_null` | Orphaned rows that can't be linked to a location |
+| `menu_item_id_not_null` | Orphaned rows that can't be linked to a menu item |
+| `date_not_null` | Rows with no date — can't partition or trend |
+| `valid_waste_reason` | Unexpected reason codes that haven't been normalised |
+| `waste_cost_gte_0` | Negative cost values — arithmetic error |
+| `quantity_consumed_gte_0` | Negative consumption — physically impossible |
+| `quantity_prepared_gt_0` | Zero-prepared batches — would cause division-by-zero in waste_percentage |
+| `waste_pct_not_null` | Null percentages — signals a calculation failure |
+
+### Gold DQ checks
+
+Gold uses a pandas-equivalent version of the same gate (since those jobs use pandas, not PySpark). Each fact table runs 4–5 referential integrity checks — confirming all surrogate keys resolved successfully after the dimension joins.
 
 ---
 
-## 8. Gold Layer — Dimension Loaders
+## 7. Gold Layer — Dimensional Model
 
-**File:** [warehouse/dim_loaders.py](../warehouse/dim_loaders.py)
-**Part of Glue job:** `food_waste_gold`
+**Scripts:** `warehouse/dim_loaders.py`, `warehouse/scd2_supplier.py`, `warehouse/fact_loaders.py`
+**Glue job:** `food_waste_gold` (Python shell — pandas is sufficient, no distributed compute needed)
 
-Loads 6 of the 7 dimension tables. DIM_SUPPLIER (SCD2) is handled separately.
+### Star schema design
 
-### DIM_DATE — programmatic generation
+```
+                    DIM_DATE
+                       │
+        DIM_LOCATION ──┤
+                       │
+        DIM_MENU   ────┼──── FACT_PRODUCTION
+                       │
+   DIM_MEAL_PERIOD ────┤
+                       │
+   DIM_CATEGORY    ────┼──── FACT_WASTE ──────── DIM_WASTE_REASON
+                       │                              │
+   DIM_SUPPLIER    ────┘                         DIM_SUPPLIER
 
-```python
-def load_dim_date() -> pd.DataFrame:
-    dates = pd.date_range("2025-01-01", "2026-12-31", freq="D")
-    df = pd.DataFrame({
-        "date_sk":    dates.strftime("%Y%m%d").astype(int),  # e.g. 20250101
-        "full_date":  dates.strftime("%Y-%m-%d"),
-        "day_of_week": dates.day_of_week + 1,  # 1=Mon … 7=Sun
-        "day_name":   dates.day_name(),
-        "month":      dates.month,
-        "month_name": dates.month_name(),
-        "quarter":    dates.quarter,
-        "year":       dates.year,
-        "is_weekend": dates.day_of_week >= 5,
-    })
+
+        DIM_LOCATION ──┐
+                       ├──── FACT_CONSUMPTION
+        DIM_MENU   ────┘
+
+        DIM_LOCATION ──┐
+                       ├──── FACT_WASTE_SUMMARY ── DIM_CATEGORY
 ```
 
-### DIM_CATEGORY — derived from Silver
+### Dimension types
 
-```python
-def load_dim_category(silver_df: pd.DataFrame) -> pd.DataFrame:
-    categories = silver_df["category"].dropna().str.upper().str.strip().unique()
-    df = pd.DataFrame({
-        "category_sk":   [str(uuid.uuid4()) for _ in categories],
-        "category_name": categories,
-    })
+| Dimension | Type | Source | Key behaviour |
+|-----------|------|--------|--------------|
+| DIM_DATE | Static/generated | Programmatic | 731 rows for 2025–2026; `date_sk` is YYYYMMDD integer |
+| DIM_CATEGORY | Static | Distinct Silver categories | UUID SKs assigned once |
+| DIM_MEAL_PERIOD | Static | 4 hardcoded values | UUID SKs assigned once |
+| DIM_WASTE_REASON | Static | 6 hardcoded normalised reasons | UUID SKs assigned once |
+| DIM_LOCATION | SCD1 | Silver location columns | Attributes updated in place on each run; no history |
+| DIM_MENU | SCD1 | Silver menu columns | Same as DIM_LOCATION |
+| DIM_SUPPLIER | SCD2 | Bronze supplier_data | Full change history — see next section |
+
+### SCD1 upsert behaviour (DIM_LOCATION and DIM_MENU)
+
+On every Gold run, the loader reads incoming data from Silver, reads the existing dimension from S3, and merges on the natural key (`location_id` or `menu_item_id`). Rows that already exist keep their surrogate key — only new rows get a fresh UUID. This means surrogate keys are stable across pipeline runs, which is important for any downstream reporting that may cache them.
+
+### Strict dimension load order
+
+Facts need surrogate keys from all dimensions before they can be built. The load sequence is fixed:
+
 ```
-
-### DIM_MEAL_PERIOD and DIM_WASTE_REASON — static
-
-```python
-def load_dim_meal_period() -> pd.DataFrame:
-    periods = ["breakfast", "lunch", "dinner", "snack"]
-    df = pd.DataFrame({
-        "meal_period_sk":   [str(uuid.uuid4()) for _ in periods],
-        "meal_period_name": periods,
-    })
-
-def load_dim_waste_reason() -> pd.DataFrame:
-    reasons = ["overproduction", "spoilage", "low demand",
-               "plate waste", "forecast miss", "prep error"]
-    df = pd.DataFrame({
-        "waste_reason_sk":   [str(uuid.uuid4()) for _ in reasons],
-        "waste_reason_name": reasons,
-    })
-```
-
-### DIM_LOCATION and DIM_MENU — SCD1 upsert
-
-SCD1 means we update in place — no history is preserved. The pattern:
-
-1. Read the incoming data (distinct rows from Silver)
-2. Try to read the existing dimension from S3 (empty DataFrame if first run)
-3. Left-merge on natural key to preserve existing surrogate keys
-4. Assign new UUIDs only for rows with no existing surrogate key
-
-```python
-def load_dim_location(silver_df: pd.DataFrame) -> pd.DataFrame:
-    src = (
-        silver_df[["location_id", "location_name", "city", "region",
-                   "location_type", "capacity", "storage_rating"]]
-        .drop_duplicates("location_id")
-        .reset_index(drop=True)
-    )
-    try:
-        existing = wr.s3.read_parquet(path=f"s3://{S3_BUCKET}/gold/dims/dim_location/data.parquet")
-    except Exception:
-        existing = pd.DataFrame(columns=["location_sk", "location_id"])
-
-    merged = src.merge(existing[["location_id", "location_sk"]], on="location_id", how="left")
-    merged["location_sk"] = merged["location_sk"].apply(
-        lambda sk: sk if pd.notna(sk) else str(uuid.uuid4())
-    )
-```
-
-### DQ gate for all dimensions
-
-Every dimension runs a duplicate-SK check before writing:
-
-```python
-def check_no_duplicate_sk(df, sk_col, dim_name):
-    dupes = df[sk_col].duplicated().sum()
-    if dupes > 0:
-        raise ValueError(f"DQ GATE FAILED [{dim_name}]: {dupes} duplicate surrogate keys.")
-```
-
-### Dimension load order
-
-```python
-def run_dim_loads(silver_df: pd.DataFrame) -> None:
-    load_dim_date()           # no dependencies
-    load_dim_category(silver_df)
-    load_dim_meal_period()
-    load_dim_waste_reason()
-    load_dim_location(silver_df)
-    load_dim_menu(silver_df)
-    # DIM_SUPPLIER is called separately (scd2_supplier.py)
+DIM_DATE
+  → DIM_CATEGORY
+    → DIM_MEAL_PERIOD
+      → DIM_WASTE_REASON
+        → DIM_LOCATION
+          → DIM_MENU
+            → DIM_SUPPLIER
+              → FACT_PRODUCTION
+                → FACT_WASTE
+                  → FACT_CONSUMPTION
+                    → FACT_WASTE_SUMMARY
 ```
 
 ---
 
-## 9. Gold Layer — SCD2 Supplier Dimension
+## 8. SCD2 — Supplier History
 
-**File:** [warehouse/scd2_supplier.py](../warehouse/scd2_supplier.py)
+**Script:** `warehouse/scd2_supplier.py`
 
-### SCD2 overview
+### Why SCD2 for suppliers
 
-Slowly Changing Dimension Type 2 tracks attribute history by creating a new row for every change to a tracked column, instead of overwriting the existing row.
+Suppliers change their quality ratings and lead times over time. SCD2 preserves this history by adding a new row for each change rather than overwriting, so historical facts can still join to the supplier attributes that were in effect at that time.
 
-**Tracked columns:** `supplier_name`, `lead_time_days`, `quality_score`
+### SCD2 columns
 
-**Required SCD2 columns:**
+Every row in DIM_SUPPLIER has:
+- `supplier_sk` — a new UUID generated for each version of the record
+- `effective_date` — when this version became active
+- `expiry_date` — when this version ended (`9999-12-31` means still current)
+- `is_current` — boolean flag, exactly one `True` per `supplier_id` at all times
 
-| Column | Description |
-|--------|-------------|
-| `supplier_sk` | UUID surrogate key — new UUID per version |
-| `supplier_id` | Natural key — stable across versions |
-| `effective_date` | ISO date this version became active |
-| `expiry_date` | ISO date this version ended (`9999-12-31` = current) |
-| `is_current` | `True` for the active version only |
+### Decision logic
 
-### Core merge logic
+```
+For each incoming supplier record:
 
-```python
-def apply_scd2(existing, incoming, today):
-    yesterday = today - timedelta(days=1)
+  Is supplier_id new?
+  └─ YES → Insert as current (expiry=9999-12-31, is_current=True)
 
-    if existing is None or existing.empty:
-        # First load: insert all as new current records
-        new_rows = incoming.copy()
-        new_rows["supplier_sk"]     = [str(uuid.uuid4()) for _ in range(len(new_rows))]
-        new_rows["effective_date"]  = today.isoformat()
-        new_rows["expiry_date"]     = FAR_FUTURE.isoformat()  # 9999-12-31
-        new_rows["is_current"]      = True
-        return new_rows[_dim_cols()]
-
-    result = existing.copy()
-    for _, new_row in incoming.iterrows():
-        sid = new_row["supplier_id"]
-        current_rec = result[(result["supplier_id"] == sid) & (result["is_current"])]
-
-        if current_rec.empty:
-            # New supplier → insert
-            insert = _build_row(new_row, today, FAR_FUTURE, True)
-            result = pd.concat([result, pd.DataFrame([insert])], ignore_index=True)
-        else:
-            idx = current_rec.index[0]
-            changed = any(
-                str(result.at[idx, c]) != str(new_row.get(c, ""))
-                for c in TRACKED_COLS
-            )
-            if changed:
-                # Close old record
-                result.at[idx, "expiry_date"] = yesterday.isoformat()
-                result.at[idx, "is_current"]  = False
-                # Insert new current record
-                insert = _build_row(new_row, today, FAR_FUTURE, True)
-                result = pd.concat([result, pd.DataFrame([insert])], ignore_index=True)
-            # else: no change → no action
+  Is supplier_id known?
+  ├─ Tracked column changed? (supplier_name, lead_time_days, quality_score)
+  │   └─ YES → Close existing row (expiry=yesterday, is_current=False)
+  │            Insert new current row
+  │
+  └─ No change?
+      └─ Do nothing — leave existing row untouched
 ```
 
-### SCD2 decision table
+### Tracked vs non-tracked columns
 
-| Scenario | Action |
-|----------|--------|
-| `supplier_id` not in existing | Insert as new current (`is_current=True`, `expiry=9999-12-31`) |
-| `supplier_id` exists, tracked col changed | Close old row (`expiry=yesterday`, `is_current=False`), insert new current |
-| `supplier_id` exists, no change | No action — leave existing row untouched |
+Only three columns trigger a new version when they change: `supplier_name`, `lead_time_days`, and `quality_score`. Columns like `supplier_city` do not trigger versioning — they are updated in place on the current record.
 
-### SCD2 DQ checks (3 hard stops)
+### Important: source is Bronze, not Silver
 
-```python
-def run_scd2_dq(df: pd.DataFrame) -> None:
-    # 1. Only one is_current=True per supplier_id
-    current_counts = df[df["is_current"]].groupby("supplier_id").size()
-    multi = current_counts[current_counts > 1]
-    if not multi.empty:
-        raise ValueError(f"DQ GATE FAILED [DIM_SUPPLIER]: multiple is_current=True rows ...")
+The SCD2 loader reads supplier data directly from the Bronze Parquet files, not from Silver. Silver does not join supplier data at all. This is by design — Silver is the production+waste+menu+location join. Supplier attribution is resolved at query time by joining `FACT_WASTE.supplier_sk` to `DIM_SUPPLIER`.
 
-    # 2. All supplier_sk values unique
-    dupes = df["supplier_sk"].duplicated().sum()
-    if dupes > 0:
-        raise ValueError(f"DQ GATE FAILED [DIM_SUPPLIER]: {dupes} duplicate supplier_sk values.")
+### DQ enforcement
 
-    # 3. No overlapping date ranges per supplier_id
-    for sid, grp in df.groupby("supplier_id"):
-        grp_sorted = grp.sort_values("effective_date")
-        for i in range(1, len(grp_sorted)):
-            if prev_expiry >= curr_effective:
-                raise ValueError(f"DQ GATE FAILED: overlapping date ranges for supplier_id={sid}")
-```
+After every SCD2 merge, three checks run before writing:
+1. No more than one `is_current=True` record per `supplier_id`
+2. All `supplier_sk` values are unique (no duplicate surrogate keys)
+3. No overlapping effective/expiry date ranges for the same `supplier_id`
 
-### Source: Bronze, not Silver
-
-Supplier data is loaded from Bronze parquet directly, not from Silver, because Silver does not join supplier data:
-
-```python
-path = f"s3://{S3_BUCKET}/bronze/source=supplier_data/"
-supplier_raw = wr.s3.read_parquet(path=path, dataset=True)
-```
+If any check fails, the entire load is aborted.
 
 ---
 
-## 10. Gold Layer — Fact Loaders
+## 9. Fact Tables
 
-**File:** [warehouse/fact_loaders.py](../warehouse/fact_loaders.py)
+**Script:** `warehouse/fact_loaders.py`
 
-Loads 4 fact tables by resolving dimension surrogate keys from the Silver layer.
+### Four fact tables and their purpose
 
-### SK resolution pattern (same for all facts)
+```
+FACT_PRODUCTION
+  Grain: one row per (date, location, menu item, meal period) production batch
+  Measures: quantity_prepared, cost_per_unit
+  Use: baseline — what was cooked
 
-```python
-# Convert date to string for join with DIM_DATE.full_date
-df["full_date"] = df["date"].astype(str)
+FACT_WASTE
+  Grain: same as production — one row per waste event
+  Measures: quantity_wasted, waste_percentage, waste_cost
+  Use: what was thrown away and how much it cost
 
-# Resolve all four SKs
-df = df.merge(dim_date[["full_date", "date_sk"]],            on="full_date",    how="left")
-df = df.merge(dim_location[["location_id", "location_sk"]],  on="location_id",  how="left")
-df = df.merge(dim_menu[["menu_item_id", "menu_sk"]],          on="menu_item_id", how="left")
-dim_mp = dim_meal_period.rename(columns={"meal_period_name": "meal_period"})
-df = df.merge(dim_mp[["meal_period", "meal_period_sk"]],      on="meal_period",  how="left")
+FACT_CONSUMPTION
+  Grain: same — derived from production minus waste
+  Measures: quantity_consumed, demand_gap
+  Use: what was actually served, and how far off the forecast was
+
+FACT_WASTE_SUMMARY  ◄── primary dashboard table
+  Grain: location + category + year + month (aggregated)
+  Measures: total_waste_quantity, total_waste_cost,
+            avg_waste_percentage, waste_event_count
+  Use: all dashboard queries — much cheaper to scan than raw FACT_WASTE
 ```
 
-### FACT_PRODUCTION
+### Why FACT_WASTE_SUMMARY matters
 
-Grain: one row per (date, location, menu item, meal period).
+All dashboard queries are directed at `FACT_WASTE_SUMMARY`, not at `FACT_WASTE`. Because the summary is pre-aggregated to location+category+month grain, each Athena query scans orders of magnitude less data. This keeps every query well within the 1 GB scan limit on the `food-waste-wg` workgroup.
 
-```python
-def load_fact_production(silver, dim_date, dim_location, dim_menu, dim_meal_period):
-    df = silver[["date", "location_id", "menu_item_id", "meal_period",
-                 "quantity_prepared", "cost_per_unit", "batch_id", "year", "month"]].copy()
-    # ... SK resolution ...
-    df["production_sk"] = [str(uuid.uuid4()) for _ in range(len(df))]
+### Surrogate key resolution
 
-    _pandas_dq(result, [
-        ("date_sk_not_null",        result["date_sk"].notna()),
-        ("location_sk_not_null",    result["location_sk"].notna()),
-        ("menu_sk_not_null",        result["menu_sk"].notna()),
-        ("meal_period_sk_not_null", result["meal_period_sk"].notna()),
-    ], "FACT_PRODUCTION")
-```
-
-### FACT_WASTE
-
-Only rows where `waste_reason` is not null (i.e. actual waste events) are included.
-
-```python
-def load_fact_waste(silver, dim_date, dim_location, dim_menu,
-                    dim_meal_period, dim_waste_reason, dim_supplier):
-    df = silver[waste_cols].dropna(subset=["waste_reason"]).copy()
-    # ... SK resolution for all dims ...
-    # Supplier: join on menu_item_id using current records only
-    current_sup = dim_supplier[dim_supplier["is_current"]].copy()
-    df = df.merge(current_sup[["menu_item_id", "supplier_sk"]], on="menu_item_id", how="left")
-```
-
-### FACT_CONSUMPTION
-
-Derived fact — production volume vs waste vs consumption.
-
-```python
-def load_fact_consumption(silver, dim_date, dim_location, dim_menu):
-    cols = ["date", "location_id", "menu_item_id", "quantity_prepared",
-            "quantity_wasted", "quantity_consumed", "demand_gap", "year", "month"]
-    # DQ: consumed >= 0, date_sk not null
-```
-
-### FACT_WASTE_SUMMARY
-
-Pre-aggregated table (by location + category + year + month) used by all dashboard queries.
-
-```python
-def load_fact_waste_summary(silver, dim_location, dim_category):
-    # Only rows where waste actually occurred
-    df = silver[silver["quantity_wasted"] > 0].copy()
-
-    agg = (
-        df.groupby(["location_id", "category_upper", "year", "month"],
-                   as_index=False, observed=True)
-        .agg(
-            total_waste_quantity=("quantity_wasted", "sum"),
-            total_waste_cost=    ("waste_cost",      "sum"),
-            avg_waste_percentage=("waste_percentage", "mean"),
-            waste_event_count=   ("quantity_wasted", "count"),
-        )
-    )
-```
-
-**Why this table exists:** All dashboard queries hit `FACT_WASTE_SUMMARY` instead of the raw `FACT_WASTE`. Since it is pre-aggregated to location+category+month granularity, it scans orders of magnitude less data per Athena query, staying well within the 1 GB scan limit.
-
-### Pandas DQ gate (mirrors PySpark version)
-
-```python
-def _pandas_dq(df: pd.DataFrame, checks: list[tuple], fact_name: str) -> None:
-    for check_name, mask in checks:
-        failing = (~mask).sum()
-        if failing > 0:
-            raise ValueError(f"DQ GATE FAILED [{fact_name}] {check_name} — {failing} rows")
-```
+Every fact table is built by joining Silver data against all relevant dimensions on their natural keys and pulling the surrogate keys through. For example, `date` (a string) is joined to `DIM_DATE.full_date` to get `date_sk`. Only the surrogate keys are stored in the fact tables — natural keys are dropped. This is standard star schema practice and keeps fact tables lean.
 
 ---
 
-## 11. Athena Analytics
+## 10. Athena Analytics
 
-**File:** [analytics/athena_queries.sql](../analytics/athena_queries.sql)
-**Workgroup:** `food-waste-wg` (1 GB per-query scan limit)
-**Database:** `food_waste_db`
+**File:** `analytics/athena_queries.sql`
+**Workgroup:** `food-waste-wg` (1 GB per-query scan limit enforced at workgroup level)
 
-All queries filter on partition columns (`year`, `month`) first, and never use `SELECT *`.
+All five queries filter on partition columns (`year`, `month`) as the first condition in the `WHERE` clause. This is mandatory — without a partition filter, Athena would scan the entire table.
 
-### Query 1 — Monthly waste trend with MoM change (LAG)
+### Query 1 — Monthly waste trend per location (LAG)
 
-```sql
-SELECT
-    dl.location_name,
-    fws.year,
-    fws.month,
-    fws.total_waste_cost,
-    LAG(fws.total_waste_cost) OVER (
-        PARTITION BY fws.location_sk
-        ORDER BY fws.year, fws.month
-    ) AS prev_month_cost,
-    ROUND(
-        (fws.total_waste_cost - LAG(fws.total_waste_cost) OVER (
-            PARTITION BY fws.location_sk ORDER BY fws.year, fws.month
-        )) * 100.0
-        / NULLIF(LAG(fws.total_waste_cost) OVER (
-            PARTITION BY fws.location_sk ORDER BY fws.year, fws.month
-        ), 0),
-        2
-    ) AS mom_pct_change
-FROM food_waste_db.fact_waste_summary fws
-JOIN food_waste_db.dim_location dl ON fws.location_sk = dl.location_sk
-WHERE fws.year = 2025 AND fws.month BETWEEN 1 AND 12
-ORDER BY dl.location_name, fws.year, fws.month;
-```
+**Business question:** Is each location improving or getting worse month over month?
 
-**Answers:** Which locations are improving or worsening each month?
-**Technique:** LAG window function
+This query uses a LAG window function to compare each month's total waste cost against the previous month's, within the same location. The result is a month-over-month percentage change that shows trends directly. LAG is ideal here because it requires no self-join — the previous month value appears as a column on the same row.
 
 ### Query 2 — Top 10 menu items by waste cost (DENSE_RANK)
 
-```sql
-SELECT ranked.menu_item_name, ranked.category,
-       ranked.total_waste_cost, ranked.waste_rank
-FROM (
-    SELECT
-        dm.menu_item_name,
-        dm.category,
-        SUM(fw.waste_cost)                              AS total_waste_cost,
-        DENSE_RANK() OVER (ORDER BY SUM(fw.waste_cost) DESC) AS waste_rank
-    FROM food_waste_db.fact_waste fw
-    JOIN food_waste_db.dim_menu dm ON fw.menu_sk = dm.menu_sk
-    WHERE fw.year = 2025 AND fw.month BETWEEN 1 AND 12
-    GROUP BY dm.menu_item_name, dm.category
-) ranked
-WHERE ranked.waste_rank <= 10
-ORDER BY ranked.waste_rank;
-```
+**Business question:** Which specific menu items are the biggest contributors to waste cost?
 
-**Answers:** Which menu items are costing the most in waste?
-**Technique:** DENSE_RANK (allows ties — multiple items can share the same rank)
+DENSE_RANK is used instead of ROW_NUMBER so that ties are handled correctly — if two items have exactly the same total waste cost, they share the same rank and both appear in the top 10.
 
 ### Query 3 — Demand vs supply gap by category (CTE)
 
-```sql
-WITH category_supply AS (
-    SELECT dm.category,
-        SUM(fp.quantity_prepared) AS total_prepared,
-        SUM(fc.quantity_consumed) AS total_consumed,
-        SUM(fc.demand_gap)        AS total_demand_gap,
-        COUNT(fp.production_sk)   AS production_events
-    FROM food_waste_db.fact_production fp
-    JOIN food_waste_db.dim_menu dm ON fp.menu_sk = dm.menu_sk
-    JOIN food_waste_db.fact_consumption fc
-        ON fp.date_sk = fc.date_sk
-       AND fp.location_sk = fc.location_sk
-       AND fp.menu_sk = fc.menu_sk
-    WHERE fp.year = 2025 AND fp.month BETWEEN 1 AND 12
-    GROUP BY dm.category
-),
-category_waste AS (
-    SELECT fws.category,
-        SUM(fws.total_waste_cost)     AS total_waste_cost,
-        AVG(fws.avg_waste_percentage) AS avg_waste_pct
-    FROM food_waste_db.fact_waste_summary fws
-    WHERE fws.year = 2025 AND fws.month BETWEEN 1 AND 12
-    GROUP BY fws.category
-)
-SELECT cs.category, cs.total_prepared, cs.total_consumed, cs.total_demand_gap,
-       cw.total_waste_cost, ROUND(cw.avg_waste_pct, 2) AS avg_waste_pct,
-       ROUND(cs.total_demand_gap * 100.0 / NULLIF(cs.total_prepared, 0), 2) AS gap_pct
-FROM category_supply cs
-JOIN category_waste cw ON cs.category = cw.category
-ORDER BY cs.total_demand_gap DESC;
-```
+**Business question:** Which food categories are consistently over-prepared?
 
-**Answers:** Which categories consistently over-prepare?
-**Technique:** CTE (two CTEs merged in final SELECT)
+Two CTEs are defined before the final SELECT: `category_supply` joins production, consumption, and menu facts to get total prepared and demand gap per category; `category_waste` pulls aggregated waste cost and percentage from the summary table. The final SELECT joins them to give a complete category-level picture. Using CTEs here avoids deeply nested subqueries and makes the logic readable.
 
 ### Query 4 — Supplier quality vs waste percentage (window AVG)
 
-```sql
-SELECT
-    ds.supplier_name, ds.supplier_city, ds.quality_score,
-    dm.menu_item_name, dm.category,
-    fw.waste_percentage,
-    AVG(fw.waste_percentage) OVER (PARTITION BY fw.supplier_sk) AS supplier_avg_waste_pct,
-    AVG(fw.waste_percentage) OVER ()                            AS overall_avg_waste_pct
-FROM food_waste_db.fact_waste fw
-JOIN food_waste_db.dim_supplier ds ON fw.supplier_sk = ds.supplier_sk
-JOIN food_waste_db.dim_menu dm     ON fw.menu_sk = dm.menu_sk
-WHERE fw.year = 2025 AND fw.month BETWEEN 1 AND 12
-  AND ds.is_current = true
-ORDER BY ds.quality_score ASC, fw.waste_percentage DESC;
-```
+**Business question:** Do suppliers with lower quality scores correlate with higher waste?
 
-**Answers:** Do lower-quality suppliers correlate with higher waste?
-**Technique:** Window AVG over supplier partition + global AVG
+A window `AVG` over `supplier_sk` computes each supplier's average waste percentage across all their items, shown alongside the individual row value and the global average. This allows analysts to compare a specific event against its supplier's typical performance and against the whole dataset — without any aggregation that would collapse the row detail.
 
 ### Query 5 — Waste reason breakdown by meal period (SUM OVER)
 
-```sql
-SELECT
-    dmp.meal_period_name,
-    dwr.waste_reason_name,
-    COUNT(fw.waste_sk)  AS event_count,
-    SUM(fw.waste_cost)  AS total_cost,
-    ROUND(
-        SUM(fw.waste_cost) * 100.0
-        / NULLIF(SUM(SUM(fw.waste_cost)) OVER (PARTITION BY fw.year, fw.month), 0),
-        2
-    ) AS pct_of_monthly_total
-FROM food_waste_db.fact_waste fw
-JOIN food_waste_db.dim_waste_reason dwr ON fw.waste_reason_sk = dwr.waste_reason_sk
-JOIN food_waste_db.dim_meal_period dmp  ON fw.year = 2025
-WHERE fw.year = 2025 AND fw.month BETWEEN 1 AND 12
-GROUP BY dmp.meal_period_name, dwr.waste_reason_name, fw.year, fw.month
-ORDER BY dmp.meal_period_name, total_cost DESC;
-```
+**Business question:** Which meal periods have the worst waste patterns and why?
 
-**Answers:** Which meal periods have the worst waste patterns?
-**Technique:** Nested window SUM (`SUM(SUM(...)) OVER`) for percentage-of-total
+A nested window `SUM(SUM(...)) OVER (PARTITION BY year, month)` computes each reason's percentage contribution to the monthly total. The inner `SUM` aggregates within the `GROUP BY`; the outer window function sums those group totals across the whole month partition.
 
 ---
 
-## 12. Root Cause Classification View
+## 11. Root Cause Classification
 
-**File:** [analytics/root_cause_view.sql](../analytics/root_cause_view.sql)
+**File:** `analytics/root_cause_view.sql`
 
-A virtual table (Athena view) that classifies each location+category+month group into one of four root causes using rule-based CASE logic.
+### What it is
 
-```sql
-CREATE OR REPLACE VIEW food_waste_db.waste_root_cause AS
-SELECT
-    dl.location_name, dl.city, dl.region,
-    fws.category AS category_name,
-    fws.year, fws.month,
-    ROUND(fws.avg_waste_percentage, 2)  AS waste_percentage,
-    fws.total_waste_cost,
-    fws.total_waste_quantity,
-    fws.waste_event_count,
-
-    CASE
-        WHEN fws.avg_waste_percentage > 40
-             AND (fws.total_waste_quantity / NULLIF(fws.waste_event_count, 0)) > 5
-            THEN 'Overproduction'
-
-        WHEN fws.category IN ('SALADS','DAIRY','FRESH JUICE','FRUITS',...)
-             AND fws.avg_waste_percentage > 20
-            THEN 'Storage / Spoilage'
-
-        WHEN fws.avg_waste_percentage > 30
-             AND (fws.total_waste_quantity / NULLIF(fws.waste_event_count, 0)) <= 5
-            THEN 'Portion Mismatch'
-
-        ELSE 'Low Demand'
-    END AS root_cause,
-
-    CASE ... END AS recommendation
-FROM food_waste_db.fact_waste_summary fws
-JOIN food_waste_db.dim_location dl ON fws.location_sk = dl.location_sk
-WHERE fws.year = 2025 AND fws.month BETWEEN 1 AND 12
-```
+An Athena view (`waste_root_cause`) that classifies every location+category+month combination into one of four root causes using rule-based CASE logic on top of `FACT_WASTE_SUMMARY`.
 
 ### Classification rules
 
-| Root Cause | Condition | Recommendation |
-|------------|-----------|----------------|
-| **Overproduction** | `avg_waste_pct > 40` AND `volume_per_event > 5` | Reduce batch size by 20-30% |
-| **Storage / Spoilage** | Perishable category AND `avg_waste_pct > 20` | Review storage + supplier lead time |
-| **Portion Mismatch** | `avg_waste_pct > 30` AND `volume_per_event <= 5` | Adjust portion sizes |
-| **Low Demand** | All other cases | Review menu item demand |
+```
+Is avg_waste_percentage > 40%  AND  avg waste per event > 5 units?
+└─ YES → OVERPRODUCTION
+         Action: Reduce batch size 20–30%
 
-**Perishable categories proxy:** `SALADS`, `DAIRY`, `FRESH JUICE`, `FRUITS` (high spoilage risk if stored improperly).
+Is category perishable (Salads, Dairy, Fresh Juice, Fruits)
+AND  avg_waste_percentage > 20%?
+└─ YES → STORAGE / SPOILAGE
+         Action: Review storage conditions and supplier lead time
 
-**Volume-per-event proxy for demand_gap:** `total_waste_quantity / waste_event_count` — high ratio = large batches wasted = overproduction signal.
+Is avg_waste_percentage > 30%  AND  avg waste per event ≤ 5 units?
+└─ YES → PORTION MISMATCH
+         Action: Adjust portion sizes
+
+All other cases
+└─ LOW DEMAND
+   Action: Review menu item — consider removal or rotation
+```
+
+### Why use proxies
+
+`FACT_WASTE_SUMMARY` is an aggregated table — it does not carry individual `demand_gap` or `waste_reason` values from the raw events. Two proxies fill the gap:
+
+- **Volume per event** (`total_waste_quantity / waste_event_count`) acts as a demand_gap proxy — large batches wasted per event signals overproduction, not portion issues
+- **Perishable category** is a proxy for spoilage-prone items, in the absence of per-row `waste_reason` in the summary table
 
 ---
 
-## 13. Airflow Orchestration
+## 12. Airflow Orchestration
 
-**File:** [orchestration/dags/food_waste_pipeline.py](../orchestration/dags/food_waste_pipeline.py)
-**Tool:** Apache Airflow via Astro CLI (local Docker)
+**File:** `orchestration/dags/food_waste_pipeline.py`
+**Platform:** Apache Airflow via Astro CLI (runs in local Docker — no cloud Airflow needed)
 
-### DAG structure
+### DAG design decisions
 
-```python
-with DAG(
-    dag_id="food_waste_pipeline",
-    schedule=None,           # manual trigger only — no automated runs
-    start_date=datetime(2025, 1, 1),
-    catchup=False,
-    default_args={
-        "owner": "food-waste-360",
-        "retries": 1,
-        "retry_delay": timedelta(minutes=5),
-        "depends_on_past": False,
-    },
-) as dag:
+- `schedule=None` — the pipeline is manually triggered. There is no business need for automated daily runs; it runs when new source data is available.
+- `catchup=False` — prevents Airflow from backfilling historical runs on first start.
+- `retries=1`, `retry_delay=5min` — each task gets one automatic retry before it is marked failed. This handles transient AWS API errors without requiring manual intervention.
+- `wait_for_completion=True` on every `GlueJobOperator` — the task polls the Glue API until the job reaches SUCCEEDED or FAILED. This is critical: without it, the Airflow task would return immediately after starting the Glue job, and the downstream task would start before the Glue job finishes.
 
-    bronze_ingestion = GlueJobOperator(
-        task_id="bronze_ingestion",
-        job_name="food_waste_bronze",
-        aws_conn_id="aws_default",
-        region_name="ap-south-1",
-        wait_for_completion=True,
-    )
-
-    silver_transform = GlueJobOperator(
-        task_id="silver_transform",
-        job_name="food_waste_silver",
-        aws_conn_id="aws_default",
-        region_name="ap-south-1",
-        wait_for_completion=True,
-    )
-
-    gold_load = GlueJobOperator(
-        task_id="gold_load",
-        job_name="food_waste_gold",
-        aws_conn_id="aws_default",
-        region_name="ap-south-1",
-        wait_for_completion=True,
-    )
-
-    bronze_ingestion >> silver_transform >> gold_load
-```
-
-### Task dependency chain
+### Failure propagation
 
 ```
-bronze_ingestion → silver_transform → gold_load
+bronze_ingestion FAILS
+    │
+    └──▶  silver_transform  BLOCKED (never starts)
+               │
+               └──▶  gold_load  BLOCKED (never starts)
 ```
 
-`wait_for_completion=True` means each GlueJobOperator polls the Glue API until the job reaches `SUCCEEDED` or `FAILED`. If a Glue job fails (including DQ gate failures), the Airflow task raises and all downstream tasks are blocked.
+Because each task depends on the previous, a DQ failure in Bronze (or a Glue job error anywhere) naturally stops the chain. The failure callback logs the task ID and execution timestamp for debugging.
 
-### Failure callback
+### Credential security
 
-```python
-def on_failure_callback(context):
-    task_id = context.get("task_instance").task_id
-    execution_date = context.get("execution_date")
-    logger.error("Task FAILED | task_id=%s | execution_date=%s | dag_id=%s",
-                 task_id, execution_date, context.get("dag").dag_id)
-```
-
-### AWS connection setup
-
-Credentials are stored in Airflow's connection manager — **never in code**:
-
-```
-Admin > Connections > New Connection
-  Conn Id:   aws_default
-  Conn Type: Amazon Web Services
-  Extra:     {"aws_access_key_id": "...",
-               "aws_secret_access_key": "...",
-               "region_name": "ap-south-1"}
-```
-
-### Starting the Airflow environment
-
-```bash
-cd orchestration
-astro dev start
-# Open http://localhost:8080  (admin / admin)
-# Add aws_default connection in UI
-# Then trigger the DAG
-astro dev run dags trigger food_waste_pipeline
-```
+AWS credentials are stored in the Airflow connection manager (`aws_default` connection in the UI). They are never written to the DAG file or any source file. The `GlueJobOperator` retrieves them from the connection at execution time.
 
 ---
 
-## 14. AWS Infrastructure Setup
+## 13. Testing Strategy
 
-### Run order
+**Directory:** `tests/`
+**Framework:** pytest + PySpark (local mode)
 
-```bash
-python aws_setup/01_s3_setup.py     # Create S3 buckets + folder structure + lifecycle rules
-python aws_setup/02_iam_setup.py    # IAM role + managed + inline policies
-python setup_aws.py                  # Upload Glue scripts + register Glue jobs + Athena setup
-```
+### Guiding principle
 
-All scripts are idempotent — safe to re-run.
+All tests use in-memory DataFrames — no AWS credentials, no S3 access, no network. This means:
+- Tests run in CI without any secrets
+- Any developer can run `pytest tests/ -v` locally with just Python and PySpark installed
+- Tests are fast (seconds, not minutes)
 
-### Running the pipeline manually (without Airflow)
+### test_quality_checks.py — testing the DQ gate itself
 
-```bash
-export S3_BUCKET=food-waste-360-596234624522
-export AWS_REGION=ap-south-1
+Six tests verify that `run_dq_gate()` behaves correctly as a gate:
 
-# 1. Bronze
-aws glue start-job-run --job-name food_waste_bronze \
-  --arguments '{"--S3_BUCKET":"food-waste-360-596234624522","--AWS_REGION":"ap-south-1"}' \
-  --region ap-south-1
+| Test | What it proves |
+|------|---------------|
+| Null in required column → raises | Gate correctly identifies missing values |
+| Value out of range (waste_pct > 100) → raises | Gate correctly identifies range violations |
+| waste > prepared → raises | Gate catches the most critical business constraint |
+| All valid rows → no exception | Gate does not produce false positives |
+| Empty check list → no exception | Gate handles edge case without crashing |
+| Duplicate IDs → raises | Gate can enforce uniqueness |
 
-# 2. Silver (after Bronze SUCCEEDED)
-aws glue start-job-run --job-name food_waste_silver \
-  --arguments '{"--S3_BUCKET":"food-waste-360-596234624522","--AWS_REGION":"ap-south-1"}' \
-  --region ap-south-1
+### test_silver_transforms.py — testing derived column logic
 
-# 3. Gold (after Silver SUCCEEDED)
-aws glue start-job-run --job-name food_waste_gold \
-  --arguments '{"--S3_BUCKET":"food-waste-360-596234624522","--AWS_REGION":"ap-south-1"}' \
-  --region ap-south-1
+Five tests verify that `build_silver()` computes the correct values and that the DQ gate integrates correctly with Silver output:
 
-# 4. Load Athena partitions (run once in Athena console, food-waste-wg workgroup)
-MSCK REPAIR TABLE food_waste_db.fact_production;
-MSCK REPAIR TABLE food_waste_db.fact_waste;
-MSCK REPAIR TABLE food_waste_db.fact_consumption;
-MSCK REPAIR TABLE food_waste_db.fact_waste_summary;
+| Test | Assertion |
+|------|-----------|
+| waste_percentage | 20 wasted / 100 prepared = exactly 20.0% |
+| waste_cost | 20 units × 50 INR/unit = exactly 1000.0 INR |
+| quantity_consumed | 100 prepared − 30 wasted = exactly 70.0 |
+| DQ fails when waste > prepared | 80 wasted / 50 prepared triggers gate |
+| DQ passes for valid row | Clean row passes all four Silver checks |
 
-# 5. Create root cause view (paste analytics/root_cause_view.sql in Athena console)
+### test_scd2.py — testing SCD2 merge logic
 
-# 6. Launch dashboard
-streamlit run dashboard/app.py
-```
+Eight tests cover every path through the SCD2 decision tree:
 
-### Polling Glue job status
-
-```bash
-aws glue get-job-runs --job-name food_waste_silver --region ap-south-1 \
-  --query 'JobRuns[0].{State:JobRunState,Error:ErrorMessage}'
-```
+| Test | Scenario covered |
+|------|-----------------|
+| New supplier → inserted as current | First-time supplier, `is_current=True`, expiry=9999-12-31 |
+| Attribute change → two rows | Old row closed (expiry=yesterday, is_current=False), new row inserted |
+| No change → still one row | Identical incoming data, no new version created |
+| Only one current after change | Invariant: exactly one `is_current=True` per supplier_id |
+| Only one current when unchanged | Same invariant, no-change path |
+| Duplicate is_current → DQ raises | DQ gate catches broken state |
+| Duplicate supplier_sk → DQ raises | DQ gate catches duplicate surrogate key |
 
 ---
 
-## 15. CI/CD — GitHub Actions
+## 14. CI/CD Pipeline
 
-**File:** [.github/workflows/pipeline_tests.yml](../.github/workflows/pipeline_tests.yml)
+**File:** `.github/workflows/pipeline_tests.yml`
 
 ### Workflow triggers
 
-```yaml
-on:
-  push:
-    branches: ["**"]
-  pull_request:
-    branches: ["**"]
-```
+The pipeline runs automatically on every push to any branch and on every pull request. No manual trigger needed.
 
-Runs on every push and every pull request, across all branches.
+### Two jobs in sequence
 
-### Jobs
+**Job 1 — Run tests**
+Installs Python 3.11 and project dependencies, then runs `pytest tests/ -v`. If any test fails, the workflow fails and the commit is blocked.
 
-**Job 1: Run tests**
+**Job 2 — Credential scan**
+Searches all Python, SQL, and YAML files for the `AKIA[0-9A-Z]{16}` pattern — the format used by AWS access key IDs. If any match is found, the build fails immediately. This is a last line of defence against accidentally committing credentials.
 
-```yaml
-- name: Set up Python
-  uses: actions/setup-python@v5
-  with:
-    python-version: "3.11"
-
-- name: Install dependencies
-  run: pip install -r requirements.txt
-
-- name: Run tests
-  run: pytest tests/ -v
-```
-
-Tests run against in-memory PySpark DataFrames — no AWS calls, no credentials required.
-
-**Job 2: Credential scan**
-
-```yaml
-- name: Scan for hardcoded AWS credentials
-  run: |
-    if grep -r "AKIA[0-9A-Z]{16}" . --include="*.py" --include="*.sql" \
-       --include="*.yml" --exclude-dir=".git"; then
-      echo "ERROR: Hardcoded AWS access key found!"
-      exit 1
-    fi
-    echo "Credential scan passed — no hardcoded keys found."
-```
-
-Scans all Python, SQL, and YAML files for the `AKIA...` access key pattern. If any match is found, the workflow fails and the commit is blocked.
+No AWS resources are touched in CI — the test suite's in-memory design means zero cloud dependency.
 
 ---
 
-## 16. Test Suite
+## 15. Dashboard
 
-**Directory:** [tests/](../tests/)
-**Framework:** pytest
-**Approach:** All tests use in-memory PySpark or pandas DataFrames — no AWS calls, no network required.
-
-### test_quality_checks.py
-
-Tests the shared `run_dq_gate()` utility with 6 test cases.
-
-#### Test 1: Null check raises
-
-```python
-def test_null_check_fails(spark):
-    df = spark.createDataFrame(
-        [("A", 10.0, 100.0, 10.0), ("B", None, 80.0, None)],
-        schema=SCHEMA,
-    )
-    with pytest.raises(ValueError, match="DQ GATE FAILED"):
-        run_dq_gate(df, [
-            ("quantity_wasted_not_null", F.col("quantity_wasted").isNotNull()),
-        ])
-```
-
-#### Test 2: Range check raises
-
-```python
-def test_range_check_fails(spark):
-    df = spark.createDataFrame(
-        [("A", 10.0, 100.0, 10.0), ("B", 90.0, 80.0, 112.5)],  # 112.5 > 100
-        schema=SCHEMA,
-    )
-    with pytest.raises(ValueError, match="DQ GATE FAILED"):
-        run_dq_gate(df, [("waste_pct_0_to_100", F.col("waste_pct").between(0, 100))])
-```
-
-#### Test 3: waste > prepared raises
-
-```python
-def test_waste_lte_prepared_fails(spark):
-    df = spark.createDataFrame(
-        [("A", 10.0, 100.0, 10.0), ("B", 110.0, 100.0, 110.0)],  # 110 > 100
-        schema=SCHEMA,
-    )
-    with pytest.raises(ValueError, match="DQ GATE FAILED"):
-        run_dq_gate(df, [
-            ("waste_lte_prepared", F.col("quantity_wasted") <= F.col("quantity_prepared")),
-        ])
-```
-
-#### Test 4: All checks pass silently
-
-```python
-def test_all_checks_pass(spark):
-    df = spark.createDataFrame(
-        [("A", 10.0, 100.0, 10.0), ("B", 20.0, 80.0, 25.0)],
-        schema=SCHEMA,
-    )
-    run_dq_gate(df, [
-        ("not_null",       F.col("quantity_wasted").isNotNull()),
-        ("pct_range",      F.col("waste_pct").between(0, 100)),
-        ("waste_lte_prep", F.col("quantity_wasted") <= F.col("quantity_prepared")),
-    ])
-    # No exception = test passes
-```
-
-#### Test 5: Empty checks list never raises
-
-```python
-def test_empty_checks_list_passes(spark):
-    df = spark.createDataFrame([("X", 5.0, 10.0, 50.0)], schema=SCHEMA)
-    run_dq_gate(df, [])
-```
-
----
-
-### test_silver_transforms.py
-
-Tests `build_silver()` derived column calculations and DQ gate enforcement. Uses a helper to build Silver DataFrames from minimal in-memory data.
-
-```python
-def make_silver(spark, prod_rows, waste_rows=None):
-    prod  = spark.createDataFrame(prod_rows or [], schema=PROD_SCHEMA)
-    waste = spark.createDataFrame(waste_rows or [], schema=WASTE_SCHEMA)
-    menu  = spark.createDataFrame([("MI001","Dal Rice","MAIN COURSE","sub","Yes",67.0,24,"Low")], MENU_SCHEMA)
-    loc   = spark.createDataFrame([("LOC001","Campus Cafe","Bangalore","South","Campus","500","A")], LOC_SCHEMA)
-    return build_silver(prod, waste, menu, loc)
-```
-
-#### Test 1: waste_percentage correct
-
-```python
-def test_waste_percentage_calculation(spark):
-    prod_rows  = [(date(2025,1,1), "LOC001", "MI001", "lunch", 100.0, 50.0, 110.0, 90.0, "b1")]
-    waste_rows = [(date(2025,1,1), "LOC001", "MI001", "lunch", 20.0, "overproduction", "Serving")]
-    silver = make_silver(spark, prod_rows, waste_rows)
-    row = silver.select("waste_percentage").first()
-    assert abs(row["waste_percentage"] - 20.0) < 0.01   # 20/100 * 100 = 20.0
-```
-
-#### Test 2: waste_cost correct
-
-```python
-def test_waste_cost_calculation(spark):
-    # 20 units wasted * 50 cost_per_unit = 1000
-    row = silver.select("waste_cost").first()
-    assert abs(row["waste_cost"] - 1000.0) < 0.01
-```
-
-#### Test 3: quantity_consumed correct
-
-```python
-def test_quantity_consumed_calculation(spark):
-    # 100 prepared - 30 wasted = 70 consumed
-    row = silver.select("quantity_consumed").first()
-    assert abs(row["quantity_consumed"] - 70.0) < 0.01
-```
-
-#### Test 4: DQ fails when waste > prepared
-
-```python
-def test_dq_fails_when_waste_exceeds_prepared(spark):
-    prod_rows  = [(date(2025,1,1), "LOC001", "MI001", "lunch", 50.0, 50.0, 60.0, 40.0, "b1")]
-    waste_rows = [(date(2025,1,1), "LOC001", "MI001", "lunch", 80.0, "overproduction", "Serving")]
-    silver = make_silver(spark, prod_rows, waste_rows)
-    with pytest.raises(ValueError, match="DQ GATE FAILED"):
-        run_dq_gate(silver, [
-            ("waste_lte_prepared", F.col("quantity_wasted") <= F.col("quantity_prepared")),
-        ])
-```
-
-#### Test 5: All Silver DQ checks pass for valid row
-
-```python
-def test_dq_passes_for_valid_row(spark):
-    # 10 wasted out of 100 prepared, all fields valid
-    run_dq_gate(silver, [
-        ("waste_lte_prepared",     F.col("quantity_wasted") <= F.col("quantity_prepared")),
-        ("waste_pct_0_to_100",     F.col("waste_percentage").between(0, 100)),
-        ("location_id_not_null",   F.col("location_id").isNotNull()),
-        ("quantity_consumed_gte_0",F.col("quantity_consumed") >= 0),
-    ])
-    # No exception = pass
-```
-
----
-
-### test_scd2.py
-
-Tests `apply_scd2()` merge logic and `run_scd2_dq()` checks using pandas DataFrames.
-
-```python
-TODAY     = date(2025, 6, 1)
-YESTERDAY = date(2025, 5, 31)
-FAR_FUTURE = date(9999, 12, 31)
-```
-
-#### Test 1: New supplier inserted as current
-
-```python
-def test_new_supplier_inserted_as_current():
-    result = apply_scd2(None, make_incoming(), TODAY)
-    assert len(result) == 1
-    row = result.iloc[0]
-    assert row["is_current"] == True
-    assert row["expiry_date"] == FAR_FUTURE.isoformat()
-    assert row["effective_date"] == TODAY.isoformat()
-```
-
-#### Test 2: Attribute change creates new version
-
-```python
-def test_changed_attribute_creates_new_version():
-    existing = make_existing(quality_score=4.5)
-    incoming = make_incoming(quality_score=3.8)   # quality_score changed
-    result = apply_scd2(existing, incoming, TODAY)
-
-    assert len(result) == 2   # old row closed + new row inserted
-
-    old = result[result["supplier_sk"] == "SK-EXISTING"].iloc[0]
-    assert old["is_current"] == False
-    assert old["expiry_date"] == YESTERDAY.isoformat()
-
-    new = result[result["supplier_sk"] != "SK-EXISTING"].iloc[0]
-    assert new["is_current"] == True
-    assert float(new["quality_score"]) == pytest.approx(3.8)
-```
-
-#### Test 3: No change → no new row
-
-```python
-def test_no_change_produces_no_new_row():
-    existing = make_existing(quality_score=4.5)
-    incoming = make_incoming(quality_score=4.5)   # identical
-    result = apply_scd2(existing, incoming, TODAY)
-    assert len(result) == 1
-    assert result.iloc[0]["supplier_sk"] == "SK-EXISTING"
-```
-
-#### Test 4: Only one is_current=True per supplier_id
-
-```python
-def test_only_one_current_per_supplier_after_change():
-    result = apply_scd2(make_existing(quality_score=4.5), make_incoming(quality_score=2.0), TODAY)
-    current_count = result[result["is_current"] == True].shape[0]
-    assert current_count == 1
-```
-
-#### Test 5: DQ raises on multiple is_current records
-
-```python
-def test_dq_raises_on_multiple_current_records():
-    bad = pd.DataFrame([
-        {"supplier_sk":"SK1","supplier_id":"SUP001","is_current":True,...},
-        {"supplier_sk":"SK2","supplier_id":"SUP001","is_current":True,...},  # duplicate!
-    ])
-    with pytest.raises(ValueError, match="DQ GATE FAILED"):
-        run_scd2_dq(bad)
-```
-
-#### Test 6: DQ raises on duplicate supplier_sk
-
-```python
-def test_dq_raises_on_duplicate_supplier_sk():
-    bad = pd.DataFrame([
-        {"supplier_sk":"SK1","supplier_id":"SUP001","is_current":False,...},
-        {"supplier_sk":"SK1","supplier_id":"SUP001","is_current":True,...},  # same SK!
-    ])
-    with pytest.raises(ValueError, match="DQ GATE FAILED"):
-        run_scd2_dq(bad)
-```
-
-### Running tests
-
-```bash
-# All tests
-pytest tests/ -v
-
-# Single file
-pytest tests/test_scd2.py -v
-
-# With coverage
-pytest tests/ -v --cov=. --cov-report=term-missing
-```
-
----
-
-## 17. Dashboard
-
-**Directory:** [dashboard/](../dashboard/)
+**Directory:** `dashboard/`
 **Tool:** Streamlit + PyAthena
-**Start:** `streamlit run dashboard/app.py`
 
-The dashboard has 5 pages. All queries target `FACT_WASTE_SUMMARY` (pre-aggregated) to minimise Athena scan cost.
+The dashboard has five pages, each focused on a different analytical angle. All queries are routed to `FACT_WASTE_SUMMARY` (the pre-aggregated table) rather than raw `FACT_WASTE` to keep Athena query costs near zero.
 
 | Page | File | Focus |
 |------|------|-------|
-| Overview | `pages/1_overview.py` | Total waste KPIs, monthly trend |
-| Location | `pages/2_location.py` | Waste by location, map view |
+| Overview | `pages/1_overview.py` | Total waste KPIs, monthly trend chart |
+| Location | `pages/2_location.py` | Per-location waste breakdown |
 | Category | `pages/3_category.py` | Waste by food category |
-| Trends | `pages/4_trends.py` | MoM change, seasonal patterns |
-| Root Cause | `pages/5_root_cause.py` | Root cause classification from `waste_root_cause` view |
+| Trends | `pages/4_trends.py` | Month-over-month change, seasonal patterns |
+| Root Cause | `pages/5_root_cause.py` | Classifications from `waste_root_cause` view with recommendations |
 
 ---
 
-## 18. Makefile Commands
+## 16. AWS Infrastructure
 
-```makefile
-make generate    # python ingestion/data_generator.py
-make run         # trigger Airflow DAG via astro dev run
-make dashboard   # streamlit run dashboard/app.py
-make test        # pytest tests/ -v
+### Provisioned resources
+
+| Resource | Name | Purpose |
+|----------|------|---------|
+| S3 bucket | `food-waste-360-596234624522` | All Bronze, Silver, Gold data |
+| S3 bucket | `food-waste-360-596234624522-athena-results` | Athena query output |
+| IAM Role | `FoodWasteGlueRole` | Glue job execution permissions |
+| Glue job | `food_waste_bronze` | Python shell, 0.0625 DPU |
+| Glue job | `food_waste_silver` | Spark, 2 × G.1X workers |
+| Glue job | `food_waste_gold` | Python shell, 0.0625 DPU |
+| Athena workgroup | `food-waste-wg` | 1 GB scan limit per query |
+| Athena database | `food_waste_db` | 11 external tables (7 dims + 4 facts) |
+
+### Setup scripts (run once, idempotent)
+
+```
+1. python aws_setup/01_s3_setup.py    →  creates buckets + folder structure
+2. python aws_setup/02_iam_setup.py   →  creates IAM role + policies
+3. python setup_aws.py                →  uploads Glue scripts to S3,
+                                          registers Glue jobs,
+                                          creates Athena workgroup + database + tables
 ```
 
----
+All three scripts are idempotent — re-running them is safe and will not create duplicates.
 
-## 19. Cost Profile
+### Cost profile
 
-All compute is serverless — **zero idle cost** beyond S3 storage.
+The entire stack is serverless. Nothing runs between pipeline executions — only S3 storage accrues a cost.
 
-| Component | Cost at rest | Cost per run |
-|-----------|-------------|-------------|
-| S3 (~1 GB) | ~$0.02/month | — |
-| Glue Bronze (Python shell, 0.0625 DPU) | $0 | ~$0.01 |
-| Glue Silver (Spark 2×G.1X, ~5 min) | $0 | ~$0.14 |
-| Glue Gold (Python shell, 0.0625 DPU) | $0 | ~$0.01 |
-| Athena queries (< 1 GB scan each) | $0 | ~$0.00 |
-| Airflow (local Docker) | $0 | $0 |
+| Component | At rest | Per run |
+|-----------|---------|---------|
+| S3 (~1 GB total data) | ~$0.02 / month | — |
+| Glue Bronze (Python shell) | $0 | ~$0.01 |
+| Glue Silver (Spark, ~5 min) | $0 | ~$0.14 |
+| Glue Gold (Python shell) | $0 | ~$0.01 |
+| Athena (< 1 GB scan / query) | $0 | ~$0.00 |
 | **Total** | **~$0.02/month** | **~$0.16/run** |
 
-**Cost controls:**
-- Glue job timeout: 30 minutes (hard limit — prevents runaway charges)
-- Athena workgroup scan limit: 1 GB per query
-- Dashboard queries hit `FACT_WASTE_SUMMARY` not raw `FACT_WASTE` (orders of magnitude less data)
-
 ---
 
-## 20. Known Bugs Fixed
+## 17. Known Bugs Fixed
 
 ### Bug 1 — Silver ambiguous column reference
 
-**Symptom:** `AnalysisException: Reference 'cost_per_unit' is ambiguous`
+**What happened:** The Silver PySpark job crashed with `AnalysisException: Reference 'cost_per_unit' is ambiguous` because both the production DataFrame and the menu DataFrame carried a column named `cost_per_unit`. After the join, Spark could not determine which one to use.
 
-**Root cause:** Both `prod_df` and `menu_dedup` carried a `cost_per_unit` column. After the join, Spark could not determine which to use.
+**Fix:** `cost_per_unit` was removed from the menu select before the join. Production's `cost_per_unit` is the correct value to use for waste cost calculations (it represents the actual batch cost, not the reference menu cost).
 
-**Fix:** Removed `cost_per_unit` from the `menu_dedup` select in `build_silver()`. Production's `cost_per_unit` is used for all downstream calculations.
-
-```python
-# Before (broken)
-menu_dedup = menu_df.dropDuplicates(["menu_item_id"]).select(
-    "menu_item_id", "cost_per_unit", "sub_category", ...
-)
-
-# After (fixed)
-menu_dedup = menu_df.dropDuplicates(["menu_item_id"]).select(
-    "menu_item_id", "sub_category", "veg_flag", "shelf_life_hours", "prep_complexity",
-)
-```
+---
 
 ### Bug 2 — Athena DDL duplicate partition columns
 
-**Symptom:** Hive rejected fact table DDL at `MSCK REPAIR TABLE`.
+**What happened:** The `MSCK REPAIR TABLE` command failed because the fact table DDL listed `year` and `month` in both the regular column list and the `PARTITIONED BY` clause. Hive/Athena rejects this — partition columns must appear only in `PARTITIONED BY`.
 
-**Root cause:** `create_tables.sql` listed `year INT` and `month INT` in both the column body AND the `PARTITIONED BY` clause. Hive rejects duplicate partition columns.
+**Fix:** `year` and `month` were removed from the column body in all four fact table `CREATE TABLE` statements. The tables were dropped and re-registered with the corrected DDL.
 
-**Fix:** Removed `year` and `month` from the column body of all four fact tables. All fact tables were dropped and re-registered in Athena.
+---
 
-### Bug 3 — setup_aws.py Tags in glue.update_job()
+### Bug 3 — Tags key rejected in glue.update_job()
 
-**Symptom:** `ParamValidationError` on re-runs of `setup_aws.py`.
+**What happened:** Re-running `setup_aws.py` raised a `ParamValidationError` because the script passed a `Tags` key inside the `JobUpdate` dict. The `update_job()` API does not accept `Tags` — only `create_job()` does.
 
-**Root cause:** `glue.update_job()` does not accept a `Tags` key in `JobUpdate` (only `create_job` accepts Tags).
+**Fix:** The `update_config` dict now explicitly excludes both `"Name"` and `"Tags"` before calling `update_job()`.
 
-**Fix:** `update_config` now excludes both `"Name"` and `"Tags"` keys before calling `update_job`.
+---
 
-### Bug 4 — Athena workgroup idempotency string mismatch
+### Bug 4 — Athena workgroup already-exists check mismatch
 
-**Symptom:** `[FAIL]` printed on re-runs even though workgroup already existed.
+**What happened:** Re-running `setup_aws.py` printed `[FAIL]` for the workgroup step even though the workgroup already existed and was fine. The exception handler was checking for the string `"already exists"` but the actual AWS error message is `"WorkGroup is already created"`.
 
-**Root cause:** The already-exists error message is `"WorkGroup is already created"` not `"already exists"`. The string match failed silently.
-
-**Fix:** Added `"already created"` as a second match string in the exception handler.
+**Fix:** Added `"already created"` as a second match string in the exception handler so re-runs are treated as idempotent success.
