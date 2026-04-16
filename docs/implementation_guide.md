@@ -21,8 +21,11 @@ A narrative technical reference explaining how every component of the pipeline w
 13. [Testing Strategy](#13-testing-strategy)
 14. [CI/CD Pipeline](#14-cicd-pipeline)
 15. [Dashboard](#15-dashboard)
-16. [AWS Infrastructure](#16-aws-infrastructure)
-17. [Known Bugs Fixed](#17-known-bugs-fixed)
+16. [Glue Job Entry Points](#16-glue-job-entry-points)
+17. [Athena Table Registration](#17-athena-table-registration)
+18. [Dependencies](#18-dependencies)
+19. [AWS Infrastructure](#19-aws-infrastructure)
+20. [Known Bugs Fixed](#20-known-bugs-fixed)
 
 ---
 
@@ -582,19 +585,61 @@ Eight tests cover every path through the SCD2 decision tree:
 
 **File:** `.github/workflows/pipeline_tests.yml`
 
-### Workflow triggers
+### What is GitHub Actions and why is it here
 
-The pipeline runs automatically on every push to any branch and on every pull request. No manual trigger needed.
+GitHub Actions is a built-in automation system inside GitHub. Every time you push code or open a pull request, GitHub automatically spins up a clean virtual machine, runs whatever steps you define in a YAML file, and reports pass or fail directly on the commit or PR. You don't need to configure a separate CI server — it's all inside the repo.
 
-### Two jobs in sequence
+In this project, GitHub Actions serves two purposes:
+1. **Automated testing** — catches bugs before they reach the main branch
+2. **Security scanning** — catches accidentally committed AWS credentials before they get into the repo history (where they'd be very hard to remove)
 
-**Job 1 — Run tests**
-Installs Python 3.11 and project dependencies, then runs `pytest tests/ -v`. If any test fails, the workflow fails and the commit is blocked.
+### How it fits into the workflow
 
-**Job 2 — Credential scan**
-Searches all Python, SQL, and YAML files for the `AKIA[0-9A-Z]{16}` pattern — the format used by AWS access key IDs. If any match is found, the build fails immediately. This is a last line of defence against accidentally committing credentials.
+```
+Developer pushes code  (or opens a Pull Request)
+         │
+         ▼
+GitHub Actions triggers automatically
+         │
+         ├──▶  Job 1: Install deps → run pytest
+         │         └─ FAIL → commit is marked ✗ on GitHub
+         │                    reviewer can see the failure before merging
+         │
+         └──▶  Job 2: Scan for hardcoded AWS keys (AKIA... pattern)
+                   └─ FAIL → build blocked, no merge allowed
+```
 
-No AWS resources are touched in CI — the test suite's in-memory design means zero cloud dependency.
+Neither job touches AWS. Tests run against in-memory DataFrames, so no credentials are needed in CI at all.
+
+### Job 1 — Run tests
+
+```
+ubuntu-latest VM
+  → checkout code
+  → install Python 3.11
+  → pip install -r requirements.txt
+  → pytest tests/ -v
+```
+
+If any test fails, the entire workflow is marked failed. GitHub shows a red ✗ on the commit, and if this was a pull request, the merge button is blocked (when branch protection is configured).
+
+### Job 2 — Credential scan
+
+After the tests pass, the workflow scans every `.py`, `.sql`, and `.yml` file for the regex pattern `AKIA[0-9A-Z]{16}`. This is the exact format of an AWS access key ID. If any match is found anywhere in the repo (other than `.git/`), the build fails and exits with code 1.
+
+This catches the most common accidental secret leak — someone copying credentials from the terminal directly into a Python file. The `.env` file is covered by `.gitignore`, but this scan is a backstop in case someone puts a key directly in code.
+
+### What triggers the workflow
+
+```yaml
+on:
+  push:
+    branches: ["**"]       # every push, every branch
+  pull_request:
+    branches: ["**"]       # every PR, regardless of target branch
+```
+
+This means every commit in the entire repo, not just `main`, is validated. Useful for catching bugs early on feature branches before they are even merged.
 
 ---
 
@@ -602,20 +647,268 @@ No AWS resources are touched in CI — the test suite's in-memory design means z
 
 **Directory:** `dashboard/`
 **Tool:** Streamlit + PyAthena
+**Start command:** `streamlit run dashboard/app.py`
 
-The dashboard has five pages, each focused on a different analytical angle. All queries are routed to `FACT_WASTE_SUMMARY` (the pre-aggregated table) rather than raw `FACT_WASTE` to keep Athena query costs near zero.
+### Architecture
 
-| Page | File | Focus |
-|------|------|-------|
-| Overview | `pages/1_overview.py` | Total waste KPIs, monthly trend chart |
-| Location | `pages/2_location.py` | Per-location waste breakdown |
-| Category | `pages/3_category.py` | Waste by food category |
-| Trends | `pages/4_trends.py` | Month-over-month change, seasonal patterns |
-| Root Cause | `pages/5_root_cause.py` | Classifications from `waste_root_cause` view with recommendations |
+The dashboard connects to Athena via PyAthena using credentials from the `.env` file. Every page creates a connection, runs a SQL query against `food_waste_db`, and renders the result using Plotly charts or Streamlit tables. Queries are cached for 5 minutes (`@st.cache_data(ttl=300)`) so repeated page visits don't re-run Athena queries unnecessarily.
+
+```
+Streamlit page loads
+      │
+      ▼
+@st.cache_data  ──hit──▶  return cached DataFrame
+      │
+     miss
+      │
+      ▼
+PyAthena connection → Athena query → S3 results bucket
+      │
+      ▼
+pandas DataFrame → Plotly chart / st.table / st.dataframe
+```
+
+The landing page (`app.py`) sets up the sidebar navigation and loads environment variables from `.env` via `python-dotenv`.
+
+### Athena connection utility (`dashboard/athena_conn.py`)
+
+All six dashboard pages share a single `get_connection()` function defined in `athena_conn.py`. It reads three environment variables — `AWS_REGION`, `ATHENA_RESULTS_BUCKET`, and `ATHENA_DATABASE` — and returns a PyAthena connection pointed at the results bucket and `food_waste_db`. If `ATHENA_RESULTS_BUCKET` is not set, it raises immediately with a clear error rather than failing silently on the first query. Every page calls `get_connection()` inside its `@st.cache_data` function so the connection is created once per cache window, not once per render.
+
+### Page 1 — Overview (`pages/1_overview.py`)
+
+**What it shows:** Platform-wide KPI tiles and a monthly bar chart.
+
+The page queries `FACT_WASTE_SUMMARY` and aggregates across all locations to produce three headline numbers:
+
+| KPI tile | What it shows |
+|----------|--------------|
+| Total Waste Quantity | Sum of all portions wasted for the selected year |
+| Total Waste Cost | Sum of INR cost of all waste |
+| Avg Waste Percentage | Mean waste percentage across all location+category+month groups |
+
+Below the KPIs, a Plotly bar chart shows total waste cost broken down by month, coloured on a red scale (darker = worse). A sidebar year selector lets users switch years if multiple years of data exist.
+
+### Page 2 — Location Analysis (`pages/2_location.py`)
+
+**What it shows:** How waste cost trends over time at each location, and which locations are the biggest offenders.
+
+The query joins `FACT_WASTE_SUMMARY` to `DIM_LOCATION` to get location names, then groups by location and month. The result is:
+
+- A multi-line Plotly chart with one line per location, showing monthly waste cost trends side by side — useful for spotting which locations are improving or worsening
+- A top-5 table showing the locations with the highest total waste cost for the year, formatted with ₹ symbol
+
+### Page 3 — Category Analysis (`pages/3_category.py`)
+
+**What it shows:** Which specific menu items are driving the most waste cost, filterable by category.
+
+Unlike the other pages, this one queries `FACT_WASTE` directly (the event-level table) joined to `DIM_MENU`, because it needs per-item detail that is not in the pre-aggregated summary. It uses `DENSE_RANK()` in the query to rank items by total waste cost.
+
+The page has a category dropdown — selecting a category filters the chart to show only items in that category. The result is a horizontal bar chart of the top 10 menu items by waste cost, making it easy to read long item names. Bars are coloured on an orange scale.
+
+### Page 4 — Trends (`pages/4_trends.py`)
+
+**What it shows:** Month-over-month waste cost change, with problem months highlighted.
+
+The query runs a LAG window function in Athena (using a CTE) to compute the percentage change from the previous month for each month in the selected year. The chart has two overlaid series on two y-axes:
+
+- **Blue line** — absolute total waste cost per month (left axis)
+- **Grey/red bars** — MoM % change (right axis); bars turn red when the change is greater than +10%
+
+Below the chart, a table lists every month where waste increased by more than 10% — giving operations managers a quick view of when things got significantly worse.
+
+### Page 5 — Root Cause (`pages/5_root_cause.py`)
+
+**What it shows:** Every location+category+month combination classified into a root cause with a specific recommendation.
+
+This page queries the `waste_root_cause` Athena view directly. The result is shown as a colour-coded interactive table:
+
+| Root Cause | Row colour | Meaning |
+|------------|-----------|---------|
+| Overproduction | Red | Too much food prepared per event |
+| Storage / Spoilage | Orange | Perishable items not stored or turned over fast enough |
+| Portion Mismatch | Yellow | High waste rate but small batches — portions are too large |
+| Low Demand | Grey | Food prepared that simply wasn't wanted |
+
+Above the table, four metric tiles show the count of each root cause across the dataset. Two dropdowns let users filter by location or by root cause. The recommendation column carries a plain-English action for each row — what the kitchen manager should do to address that specific waste pattern.
 
 ---
 
-## 16. AWS Infrastructure
+### Page 6 — AI Chatbot (`dashboard/pages/6_chatbot.py`)
+
+**What it is:** A natural language interface to the entire data warehouse. A user types a plain-English question, and the page returns a spoken answer plus the underlying data table and chart — no SQL knowledge required.
+
+**Model:** AWS Bedrock Nova Micro (`apac.amazon.nova-micro-v1:0`) — a fast, low-cost model in the APAC region that is well-suited for structured SQL generation tasks.
+
+### How the chatbot works end to end
+
+```
+User types: "Which location wasted the most in January?"
+         │
+         ▼
+Call 1 — Bedrock Nova Micro (SQL generation)
+  System prompt: full schema context (all 11 tables + column names + strict rules)
+  Output: a valid Athena SQL query string
+         │
+         ▼
+SQL Validator (local — no LLM call)
+  Blocks: INSERT / UPDATE / DELETE / DROP / CREATE / ALTER / TRUNCATE
+  Blocks: SELECT *
+  Blocks: any query with no SELECT at all
+  If blocked → show error, stop
+         │
+         ▼
+PyAthena — execute query against food_waste_db
+  Returns: pandas DataFrame (up to LIMIT 100 rows)
+         │
+         ▼
+Call 2 — Bedrock Nova Micro (narration)
+  System prompt: "concise analyst — 2-3 sentences, highlight the key number"
+  Input: user question + first 50 rows of results as JSON
+  Output: plain-English answer
+         │
+         ▼
+Streamlit chat UI renders:
+  - Narrated answer (markdown)
+  - Auto-generated Plotly chart (heuristic — no extra API call)
+  - Full results table (st.dataframe)
+  - Expandable "View generated SQL" section
+```
+
+### Schema context injected into every SQL generation call
+
+The system prompt given to Nova Micro for SQL generation includes all 11 table names and their columns, plus strict rules the model must follow:
+
+- Always prefix table names with `food_waste_db.`
+- Only add `year`/`month` filters if the user explicitly mentions a time period
+- Never use `SELECT *`
+- Always add `LIMIT 100`
+- Prefer `fact_waste_summary` for aggregated questions to minimise scan cost
+- Use `LOWER()` for string comparisons
+
+This injected schema context is what allows the model to write correct Athena SQL without any fine-tuning.
+
+### SQL validator — why it exists
+
+The validator runs locally (no LLM call) and blocks any write operation before it reaches Athena. This is necessary because LLMs can occasionally produce malformed output, and a `DROP TABLE` reaching Athena would be catastrophic. The validator uses a regex check for blocked keywords (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`, `TRUNCATE`, `REPLACE`, `MERGE`) and a separate check for `SELECT *` (blocked by the project's own conventions). If validation fails, the error is shown in the chat UI and the query never executes.
+
+### Auto-visualisation — heuristic, no extra API call
+
+After the query runs, the page automatically picks the most appropriate chart type by inspecting the DataFrame structure — without making a third Bedrock call:
+
+| DataFrame shape | Chart chosen |
+|-----------------|-------------|
+| Has `month` column + ≤ 36 rows | Line chart (time series) |
+| Has a label column (location_name, category, etc.) | Horizontal bar chart |
+| Has two numeric columns, no label | Scatter plot |
+| None of the above | No chart |
+
+### Chat history
+
+The full conversation is stored in `st.session_state.messages` so it persists across questions within the same browser session. Each message stores the role (user/assistant), the narrated text, the DataFrame, and the generated SQL. This allows the user to scroll back through the full Q&A history and re-examine previous queries.
+
+### Suggested questions
+
+On first load (empty history), six suggested question buttons are shown to guide new users:
+
+- "Which location had the highest waste cost in 2026?"
+- "What are the top 5 menu items by waste quantity?"
+- "Show monthly waste trend for 2025"
+- "Which waste reason is most common?"
+- "Compare waste cost between 2025 and 2026"
+- "Which category has the worst waste percentage?"
+
+Clicking a button pre-fills the question into the chat input and triggers the full answer pipeline.
+
+---
+
+## 16. Glue Job Entry Points
+
+**Directory:** `glue_scripts/`
+**Files:** `glue_bronze.py`, `glue_silver.py`, `glue_gold.py`
+
+### Why these files exist separately
+
+The business logic lives in `ingestion/`, `transforms/`, and `warehouse/`. The `glue_scripts/` files are thin wrappers — their only job is to bootstrap the Glue environment, parse Glue job arguments, set environment variables, and then call into the business logic.
+
+This separation keeps the business logic testable locally (those files have no Glue dependencies) while the Glue entry points handle all the AWS-specific plumbing.
+
+### The zip bootstrapping problem
+
+Glue Python shell jobs receive the project as a `.zip` file via `--extra-py-files`. However, Python's built-in zip import (`zipimport`) sometimes fails to resolve sub-packages when modules reference each other across directories. To work around this, both Bronze and Gold entry points explicitly extract the zip to `/tmp/fw360_pkg/` at startup and prepend that path to `sys.path`.
+
+```
+Glue Python shell starts
+      │
+      ▼
+Search sys.path + /tmp for food_waste_360*.zip
+      │
+      ▼
+Extract to /tmp/fw360_pkg/
+      │
+      ▼
+sys.path.insert(0, "/tmp/fw360_pkg")
+      │
+      ▼
+from ingestion.bronze_loader import load_bronze   ← now works reliably
+```
+
+The Silver script (`glue_silver.py`) uses the `glueetl` type (Spark), so it bootstraps differently — it initialises `GlueContext` and `SparkContext` directly, which is the standard Glue Spark pattern. No zip extraction needed because Spark distributes the package across workers differently.
+
+### Argument handling
+
+Each entry point uses `getResolvedOptions` from `awsglue.utils` to pull job arguments passed via `--arguments` in the AWS CLI or Airflow. Required arguments (`S3_BUCKET`, `JOB_NAME`) fail hard if missing. Optional arguments (`RUN_DATE`, `ATHENA_DATABASE`) are wrapped in try/except and fall back to sensible defaults (today's date, `food_waste_db`).
+
+When running locally with no Glue environment, the `import awsglue` line raises `ImportError`, which is caught — the scripts then rely on environment variables already being set in the shell.
+
+---
+
+## 17. Athena Table Registration
+
+**File:** `analytics/create_tables.sql`
+
+### What this file does
+
+This SQL file creates the `food_waste_db` database and registers all 11 Gold tables as **external Parquet tables** pointing to S3. "External" means Athena does not own or manage the data — it only reads Parquet files that the Glue Gold job has written. Dropping a table in Athena does not delete the S3 data.
+
+All tables specify `STORED AS PARQUET` with `TBLPROPERTIES ('parquet.compress' = 'SNAPPY')`. SNAPPY compression is lossless, fast to decompress, and well-supported by both PySpark (write) and Athena (read).
+
+### Dimension tables — no partitioning
+
+Dimension tables are flat, unpartitioned tables. They are small (20–731 rows) and change infrequently, so partitioning would add complexity without any meaningful scan cost benefit.
+
+### Fact tables — partitioned by year and month
+
+All four fact tables use `PARTITIONED BY (year INT, month INT)`. This tells Athena it can skip entire month-worth of files when a query filters on `year` and `month`. Without this, every dashboard query would scan the full table. After each Gold job run, `MSCK REPAIR TABLE` must be executed once per fact table to register the new partition directories — Athena does not auto-discover them from S3.
+
+### The duplicate partition column bug (fixed)
+
+An earlier version listed `year INT` and `month INT` in both the regular column list and the `PARTITIONED BY` clause. Hive/Athena rejects this — partition columns must only appear in `PARTITIONED BY`. All four fact tables were dropped and re-registered with corrected DDL. See section 20 for full details.
+
+---
+
+## 18. Dependencies
+
+**File:** `requirements.txt`
+
+| Package | Version | Used by |
+|---------|---------|---------|
+| `pyspark` | 3.5.0 | Silver transform, unit tests |
+| `boto3` | 1.34.0 | Bronze/Gold loaders, SCD2, Bedrock chatbot |
+| `pyathena` | 3.0.10 | Dashboard — Athena connection |
+| `streamlit` | 1.56.0 | Dashboard — all 6 pages |
+| `apache-airflow-providers-amazon` | 8.19.0 | DAG — GlueJobOperator |
+| `faker` | 24.0.0 | Data generator |
+| `pytest` | 8.1.0 | Test suite |
+| `pandas` | 2.2.0 | Bronze, Gold, dashboard |
+| `pyarrow` | 15.0.0 | Parquet read/write engine |
+| `python-dotenv` | 1.0.1 | Dashboard — load `.env` |
+| `plotly` | 5.20.0 | Dashboard — all charts |
+
+`awswrangler` is used in the Glue jobs for S3 Parquet I/O but is pre-installed in the Glue environment — it is not in `requirements.txt` to avoid version conflicts in the local/CI environment.
+
+---
+
+## 19. AWS Infrastructure
 
 ### Provisioned resources
 
@@ -657,7 +950,7 @@ The entire stack is serverless. Nothing runs between pipeline executions — onl
 
 ---
 
-## 17. Known Bugs Fixed
+## 20. Known Bugs Fixed
 
 ### Bug 1 — Silver ambiguous column reference
 
