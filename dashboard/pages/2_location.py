@@ -17,9 +17,16 @@ st.markdown("Monthly waste trend and top locations by cost.")
 
 
 @st.cache_data(ttl=300)
-def load_location_trend() -> pd.DataFrame:
+def load_available_years() -> list:
     conn = get_connection()
-    query = """
+    df = pd.read_sql("SELECT DISTINCT year FROM food_waste_db.fact_waste_summary ORDER BY year", conn)
+    return sorted(df["year"].astype(int).tolist())
+
+
+@st.cache_data(ttl=300)
+def load_location_trend(year: int) -> pd.DataFrame:
+    conn = get_connection()
+    query = f"""
         SELECT
             dl.location_name,
             fws.year,
@@ -30,17 +37,19 @@ def load_location_trend() -> pd.DataFrame:
         FROM food_waste_db.fact_waste_summary fws
         JOIN food_waste_db.dim_location dl
             ON fws.location_sk = dl.location_sk
-        WHERE fws.year = 2025
-          AND fws.month BETWEEN 1 AND 12
+        WHERE fws.year = {year}
         GROUP BY dl.location_name, fws.year, fws.month
         ORDER BY fws.year, fws.month
     """
     return pd.read_sql(query, conn)
 
 
+years = load_available_years()
+selected_year = st.sidebar.selectbox("Year", options=years, index=len(years) - 1)
+
 with st.spinner("Loading location data..."):
     try:
-        df = load_location_trend()
+        df = load_location_trend(selected_year)
 
         if df.empty:
             st.warning("No location data available.")

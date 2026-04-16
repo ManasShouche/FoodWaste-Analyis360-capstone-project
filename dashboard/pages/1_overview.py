@@ -17,9 +17,16 @@ st.markdown("Platform-wide KPIs and monthly waste cost trend.")
 
 
 @st.cache_data(ttl=300)
-def load_kpis() -> pd.DataFrame:
+def load_available_years() -> list:
     conn = get_connection()
-    query = """
+    df = pd.read_sql("SELECT DISTINCT year FROM food_waste_db.fact_waste_summary ORDER BY year", conn)
+    return sorted(df["year"].astype(int).tolist())
+
+
+@st.cache_data(ttl=300)
+def load_kpis(year: int) -> pd.DataFrame:
+    conn = get_connection()
+    query = f"""
         SELECT
             year,
             month,
@@ -27,17 +34,19 @@ def load_kpis() -> pd.DataFrame:
             SUM(total_waste_cost)      AS total_waste_cost,
             AVG(avg_waste_percentage)  AS avg_waste_percentage
         FROM food_waste_db.fact_waste_summary
-        WHERE year = 2025
-          AND month BETWEEN 1 AND 12
+        WHERE year = {year}
         GROUP BY year, month
         ORDER BY year, month
     """
     return pd.read_sql(query, conn)
 
 
+years = load_available_years()
+selected_year = st.sidebar.selectbox("Year", options=years, index=len(years) - 1)
+
 with st.spinner("Loading overview data..."):
     try:
-        df = load_kpis()
+        df = load_kpis(selected_year)
 
         if df.empty:
             st.warning("No data found in FACT_WASTE_SUMMARY. Run the pipeline first.")
@@ -68,7 +77,7 @@ with st.spinner("Loading overview data..."):
                 x="month_label",
                 y="total_waste_cost",
                 labels={"month_label": "Month", "total_waste_cost": "Total Waste Cost (₹)"},
-                title="Monthly Total Waste Cost (2025)",
+                title=f"Monthly Total Waste Cost ({selected_year})",
                 color="total_waste_cost",
                 color_continuous_scale="Reds",
             )

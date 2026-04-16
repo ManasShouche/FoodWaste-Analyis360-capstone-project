@@ -17,9 +17,16 @@ st.markdown("Top menu items by waste cost, filtered by category.")
 
 
 @st.cache_data(ttl=300)
-def load_menu_waste() -> pd.DataFrame:
+def load_available_years() -> list:
     conn = get_connection()
-    query = """
+    df = pd.read_sql("SELECT DISTINCT year FROM food_waste_db.fact_waste_summary ORDER BY year", conn)
+    return sorted(df["year"].astype(int).tolist())
+
+
+@st.cache_data(ttl=300)
+def load_menu_waste(year: int) -> pd.DataFrame:
+    conn = get_connection()
+    query = f"""
         SELECT
             dm.menu_item_name,
             dm.category,
@@ -30,17 +37,19 @@ def load_menu_waste() -> pd.DataFrame:
         FROM food_waste_db.fact_waste fw
         JOIN food_waste_db.dim_menu dm
             ON fw.menu_sk = dm.menu_sk
-        WHERE fw.year = 2025
-          AND fw.month BETWEEN 1 AND 12
+        WHERE fw.year = {year}
         GROUP BY dm.menu_item_name, dm.category
         ORDER BY total_waste_cost DESC
     """
     return pd.read_sql(query, conn)
 
 
+years = load_available_years()
+selected_year = st.sidebar.selectbox("Year", options=years, index=len(years) - 1)
+
 with st.spinner("Loading category data..."):
     try:
-        df = load_menu_waste()
+        df = load_menu_waste(selected_year)
 
         if df.empty:
             st.warning("No menu waste data available.")

@@ -17,17 +17,23 @@ st.markdown("Month-over-month waste cost change. Months with >10% increase are h
 
 
 @st.cache_data(ttl=300)
-def load_trends() -> pd.DataFrame:
+def load_available_years() -> list:
     conn = get_connection()
-    query = """
+    df = pd.read_sql("SELECT DISTINCT year FROM food_waste_db.fact_waste_summary ORDER BY year", conn)
+    return sorted(df["year"].astype(int).tolist())
+
+
+@st.cache_data(ttl=300)
+def load_trends(year: int) -> pd.DataFrame:
+    conn = get_connection()
+    query = f"""
         WITH monthly AS (
             SELECT
                 year,
                 month,
                 SUM(total_waste_cost) AS total_waste_cost
             FROM food_waste_db.fact_waste_summary
-            WHERE year = 2025
-              AND month BETWEEN 1 AND 12
+            WHERE year = {year}
             GROUP BY year, month
         )
         SELECT
@@ -47,9 +53,12 @@ def load_trends() -> pd.DataFrame:
     return pd.read_sql(query, conn)
 
 
+years = load_available_years()
+selected_year = st.sidebar.selectbox("Year", options=years, index=len(years) - 1)
+
 with st.spinner("Loading trend data..."):
     try:
-        df = load_trends()
+        df = load_trends(selected_year)
 
         if df.empty:
             st.warning("No trend data available.")
