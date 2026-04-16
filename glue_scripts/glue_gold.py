@@ -1,22 +1,3 @@
-"""
-Glue Gold Job — Food Waste Optimization 360
-Type: Python shell (pandas-based dim + fact loads — no Spark needed)
-
-Glue job arguments:
-  --S3_BUCKET          : data bucket (Bronze/Silver source + Gold destination)
-  --ATHENA_DATABASE    : Athena database name (default: food_waste_db)
-  --ATHENA_WORKGROUP   : Athena workgroup name (default: food-waste-wg)
-  --RUN_DATE           : optional ISO date for SCD2 effective dating (default: today)
-
-Execution order (strict — facts resolve surrogate keys from dims):
-  1. Dimensions  — DIM_DATE, DIM_CATEGORY, DIM_MEAL_PERIOD, DIM_WASTE_REASON,
-                   DIM_LOCATION (SCD1), DIM_MENU (SCD1), DIM_SUPPLIER (SCD2)
-  2. Facts       — FACT_PRODUCTION, FACT_WASTE, FACT_CONSUMPTION, FACT_WASTE_SUMMARY
-
-NOTE: Supplier data is read from Bronze, not Silver.
-      Silver joins production + waste + menu + location only.
-      Supplier columns are never propagated into the Silver layer.
-"""
 
 import os
 import sys
@@ -24,9 +5,7 @@ import zipfile
 import glob
 from datetime import date
 
-# ---------------------------------------------------------------------------
-# Unzip project package so warehouse submodules are importable in Python shell
-# ---------------------------------------------------------------------------
+
 _extract_dir = "/tmp/fw360_pkg"
 os.makedirs(_extract_dir, exist_ok=True)
 
