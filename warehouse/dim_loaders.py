@@ -53,7 +53,7 @@ def check_no_duplicate_sk(df: pd.DataFrame, sk_col: str, dim_name: str) -> None:
 # ---------------------------------------------------------------------------
 def load_dim_date() -> pd.DataFrame:
     print("Loading DIM_DATE ...")
-    dates = pd.date_range("2025-01-01", "2025-12-31", freq="D")
+    dates = pd.date_range("2025-01-01", "2026-12-31", freq="D")
     df = pd.DataFrame({
         "date_sk":    dates.strftime("%Y%m%d").astype(int),
         "full_date":  dates.strftime("%Y-%m-%d"),
