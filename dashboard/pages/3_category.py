@@ -44,8 +44,8 @@ def load_menu_waste(year: int) -> pd.DataFrame:
     return pd.read_sql(query, conn)
 
 
-years = load_available_years()
-selected_year = st.sidebar.selectbox("Year", options=years, index=len(years) - 1)
+years = load_available_years() or [2025]
+selected_year = st.sidebar.selectbox("Year", options=years, index=max(0, len(years) - 1))
 
 with st.spinner("Loading category data..."):
     try:
