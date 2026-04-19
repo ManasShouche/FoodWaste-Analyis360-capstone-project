@@ -10,6 +10,7 @@ import plotly.express as px
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from athena_conn import get_connection
+from chart_theme import apply_theme
 
 st.set_page_config(page_title="Location Analysis", layout="wide")
 st.title("Location Analysis")
@@ -58,20 +59,26 @@ with st.spinner("Loading location data..."):
                 lambda r: pd.Timestamp(f"{int(r['year'])}-{int(r['month']):02d}-01"), axis=1
             )
 
-            # Line chart
+            # Top N slider
+            top_n = st.slider("Show top N locations by total waste cost", min_value=3, max_value=20, value=4)
+            top_locations = (
+                df.groupby("location_name")["total_waste_cost"]
+                .sum()
+                .nlargest(top_n)
+                .index.tolist()
+            )
+            filtered_top = df[df["location_name"].isin(top_locations)]
+
             fig = px.line(
-                df,
+                filtered_top.sort_values("period"),
                 x="period",
                 y="total_waste_cost",
                 color="location_name",
-                labels={
-                    "period": "Month",
-                    "total_waste_cost": "Total Waste Cost (₹)",
-                    "location_name": "Location",
-                },
-                title="Monthly Waste Cost by Location",
                 markers=True,
+                labels={"total_waste_cost": "Total Waste Cost (₹)", "period": "Month", "location_name": "Location"},
+                title=f"Monthly Waste Cost — Top {top_n} Locations",
             )
+            apply_theme(fig)
             st.plotly_chart(fig, use_container_width=True)
 
             st.markdown("---")

@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from athena_conn import get_connection
+from chart_theme import apply_theme
 
 st.set_page_config(page_title="Trends", layout="wide")
 st.title("Waste Trends")
@@ -107,6 +108,7 @@ with st.spinner("Loading trend data..."):
                 legend={"x": 0.01, "y": 0.99},
                 hovermode="x unified",
             )
+            apply_theme(fig)
             st.plotly_chart(fig, use_container_width=True)
 
             # Table of months with > 10% increase

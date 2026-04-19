@@ -10,6 +10,7 @@ import plotly.express as px
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from athena_conn import get_connection
+from chart_theme import apply_theme
 
 st.set_page_config(page_title="Overview", layout="wide")
 st.title("Overview")
@@ -82,6 +83,7 @@ with st.spinner("Loading overview data..."):
                 color_continuous_scale="Reds",
             )
             fig.update_layout(coloraxis_showscale=False)
+            apply_theme(fig)
             st.plotly_chart(fig, use_container_width=True)
 
     except Exception as e:

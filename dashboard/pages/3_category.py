@@ -10,6 +10,7 @@ import plotly.express as px
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from athena_conn import get_connection
+from chart_theme import apply_theme
 
 st.set_page_config(page_title="Category Analysis", layout="wide")
 st.title("Category Analysis")
@@ -75,6 +76,7 @@ with st.spinner("Loading category data..."):
                 color_continuous_scale="Oranges",
             )
             fig.update_layout(coloraxis_showscale=False, yaxis={"categoryorder": "total ascending"})
+            apply_theme(fig)
             st.plotly_chart(fig, use_container_width=True)
 
     except Exception as e:

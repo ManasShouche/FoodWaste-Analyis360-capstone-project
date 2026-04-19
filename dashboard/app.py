@@ -5,6 +5,21 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
 import streamlit as st
+import plotly.io as pio
+import plotly.graph_objects as go
+
+pio.templates["warm"] = go.layout.Template(
+    layout=go.Layout(
+        font=dict(color="#2C1A0E", size=13),
+        title=dict(font=dict(color="#2C1A0E", size=16)),
+        xaxis=dict(tickfont=dict(color="#2C1A0E"), title=dict(font=dict(color="#2C1A0E"))),
+        yaxis=dict(tickfont=dict(color="#2C1A0E"), title=dict(font=dict(color="#2C1A0E"))),
+        legend=dict(font=dict(color="#2C1A0E")),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+)
+pio.templates.default = "plotly+warm"
 
 st.set_page_config(
     page_title="Food Waste Optimization 360",
