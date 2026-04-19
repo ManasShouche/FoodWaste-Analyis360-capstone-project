@@ -735,89 +735,115 @@ Above the table, four metric tiles show the count of each root cause across the 
 
 ### Page 6 — AI Chatbot (`dashboard/pages/6_chatbot.py`)
 
-**What it is:** A natural language interface to the entire data warehouse. A user types a plain-English question, and the page returns a spoken answer plus the underlying data table and chart — no SQL knowledge required.
+**What it is:** A natural language interface to the entire data warehouse. A user types a plain-English question and gets a spoken answer, the underlying data table, and a chart — no SQL knowledge required. The chatbot handles three types of input intelligently: data questions (triggers SQL + Athena), ambiguous questions (asks for clarification), and general knowledge questions (answers directly without touching the database).
 
-**Model:** AWS Bedrock Nova Micro (`apac.amazon.nova-micro-v1:0`) — a fast, low-cost model in the APAC region that is well-suited for structured SQL generation tasks.
+**Model:** AWS Bedrock Claude Haiku (`apac.anthropic.claude-3-haiku-20240307-v1:0`) — upgraded from Nova Micro for stronger schema reasoning and better handling of edge cases and ambiguous questions.
 
-### How the chatbot works end to end
+**Estimated cost:** ~$0.00059 per question (2–3 Bedrock calls). Under $4/month at heavy usage.
+
+### Architecture — three-path routing
+
+The chatbot no longer blindly generates SQL for every input. A router call first classifies the question into one of three paths:
 
 ```
-User types: "Which location wasted the most in January?"
+User types a question
          │
          ▼
-Call 1 — Bedrock Nova Micro (SQL generation)
-  System prompt: full schema context (all 11 tables + column names + strict rules)
-  Output: a valid Athena SQL query string
+Call 1 — Claude Haiku (router)
+  System prompt: classify as QUERY / CLARIFY / ANSWER
          │
-         ▼
-SQL Validator (local — no LLM call)
-  Blocks: INSERT / UPDATE / DELETE / DROP / CREATE / ALTER / TRUNCATE
-  Blocks: SELECT *
-  Blocks: any query with no SELECT at all
-  If blocked → show error, stop
+         ├─ CLARIFY → ask user for more detail (no SQL, no Athena)
          │
-         ▼
-PyAthena — execute query against food_waste_db
-  Returns: pandas DataFrame (up to LIMIT 100 rows)
+         ├─ ANSWER  → reply directly from model knowledge (no SQL, no Athena)
          │
-         ▼
-Call 2 — Bedrock Nova Micro (narration)
-  System prompt: "concise analyst — 2-3 sentences, highlight the key number"
-  Input: user question + first 50 rows of results as JSON
-  Output: plain-English answer
-         │
-         ▼
-Streamlit chat UI renders:
-  - Narrated answer (markdown)
-  - Auto-generated Plotly chart (heuristic — no extra API call)
-  - Full results table (st.dataframe)
-  - Expandable "View generated SQL" section
+         └─ QUERY ──────────────────────────────────────────────────┐
+                                                                     ▼
+                                               Call 2 — Claude Haiku (SQL generation)
+                                                 System prompt: live schema context
+                                                 Output: Athena SQL query
+                                                         │
+                                                         ▼
+                                               SQL Validator (local — no LLM call)
+                                                 Blocks: INSERT/UPDATE/DELETE/DROP/CREATE
+                                                 Blocks: SELECT *
+                                                         │
+                                                         ▼
+                                               PyAthena — execute query
+                                                 Returns: pandas DataFrame (LIMIT 100)
+                                                         │
+                                                 ┌───────┴──────────┐
+                                                 │ Athena error?    │
+                                                 │ YES → send error │
+                                                 │ back to Claude   │
+                                                 │ (retry up to 2×) │
+                                                 └───────┬──────────┘
+                                                         ▼
+                                               Call 3 — Claude Haiku (narration)
+                                                 Input: question + first 50 rows as JSON
+                                                 Output: 2-3 sentence plain-English answer
+                                                         │
+                                                         ▼
+                                               Streamlit UI renders:
+                                                 - Narrated answer
+                                                 - Auto chart (heuristic)
+                                                 - Full results table
+                                                 - Expandable SQL panel
 ```
 
-### Schema context injected into every SQL generation call
+### Router — why this is an architectural change
 
-The system prompt given to Nova Micro for SQL generation includes all 11 table names and their columns, plus strict rules the model must follow:
+Previously every message triggered SQL generation and an Athena query, which caused errors on vague inputs ("show me something") and wasted Bedrock calls on general questions ("what is food waste?"). The router adds a zero-cost decision layer:
 
-- Always prefix table names with `food_waste_db.`
-- Only add `year`/`month` filters if the user explicitly mentions a time period
-- Never use `SELECT *`
-- Always add `LIMIT 100`
-- Prefer `fact_waste_summary` for aggregated questions to minimise scan cost
-- Use `LOWER()` for string comparisons
+| Input type | Example | Router output | Bedrock calls |
+|---|---|---|---|
+| Data question | "Which location wasted most?" | `QUERY` | 3 (route + SQL + narrate) |
+| Ambiguous | "Show me something interesting" | `CLARIFY: Which metric or location?` | 1 (route only) |
+| General knowledge | "What does waste percentage mean?" | `ANSWER: It is the ratio of...` | 1 (route only) |
 
-This injected schema context is what allows the model to write correct Athena SQL without any fine-tuning.
+### Self-healing SQL — error retry loop
+
+If Athena rejects a query, the error message and failing SQL are sent back to Claude with a prompt to fix it. The corrected SQL is re-executed automatically. The user only sees an error if both attempts fail. This removes the most common class of Athena errors (wrong column names, bad joins) without manual intervention.
+
+### Live schema from Athena `information_schema`
+
+The schema context injected into the SQL generation prompt is no longer hardcoded. On startup the chatbot queries `information_schema.columns` for all tables in `food_waste_db` and builds the prompt dynamically. This means any future column additions or renames in Athena automatically appear in the next prompt — no code change needed. The result is cached for 1 hour. A hardcoded fallback is used if the `information_schema` query itself fails.
+
+Additional constraints are appended as explicit notes on top of the live schema:
+- `fact_waste_summary` has no `menu_sk` — filter by the `category` string column directly
+- `cost_per_unit` not `unit_cost` in `fact_production`
+- `storage_rating` is a string (`'A'`, `'B'`, `'C'`), not a number
+- Month names must be converted to integers — fact tables have no `month_name` column
+- Supplier questions must go through `fact_waste` (has `supplier_sk`), not `fact_waste_summary`
 
 ### SQL validator — why it exists
 
-The validator runs locally (no LLM call) and blocks any write operation before it reaches Athena. This is necessary because LLMs can occasionally produce malformed output, and a `DROP TABLE` reaching Athena would be catastrophic. The validator uses a regex check for blocked keywords (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`, `TRUNCATE`, `REPLACE`, `MERGE`) and a separate check for `SELECT *` (blocked by the project's own conventions). If validation fails, the error is shown in the chat UI and the query never executes.
+The validator runs locally (no LLM call) and blocks any write operation before it reaches Athena. A `DROP TABLE` reaching Athena would be catastrophic. The validator uses regex to block (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`, `TRUNCATE`, `REPLACE`, `MERGE`) and a separate check for `SELECT *`. If validation fails the error is shown immediately and the query never executes.
 
 ### Auto-visualisation — heuristic, no extra API call
 
-After the query runs, the page automatically picks the most appropriate chart type by inspecting the DataFrame structure — without making a third Bedrock call:
-
 | DataFrame shape | Chart chosen |
-|-----------------|-------------|
+|---|---|
 | Has `month` column + ≤ 36 rows | Line chart (time series) |
 | Has a label column (location_name, category, etc.) | Horizontal bar chart |
 | Has two numeric columns, no label | Scatter plot |
 | None of the above | No chart |
 
+All charts use the shared `chart_theme.apply_theme()` function for consistent warm-toned dark text styling.
+
 ### Chat history
 
-The full conversation is stored in `st.session_state.messages` so it persists across questions within the same browser session. Each message stores the role (user/assistant), the narrated text, the DataFrame, and the generated SQL. This allows the user to scroll back through the full Q&A history and re-examine previous queries.
+The full conversation is stored in `st.session_state.messages` and persists across the browser session. Each message stores the role, narrated text, DataFrame, and generated SQL.
 
 ### Suggested questions
 
-On first load (empty history), six suggested question buttons are shown to guide new users:
+Six suggested question buttons shown on first load:
 
-- "Which location had the highest waste cost in 2026?"
+- "Which location had the highest waste cost in 2025?"
 - "What are the top 5 menu items by waste quantity?"
 - "Show monthly waste trend for 2025"
 - "Which waste reason is most common?"
-- "Compare waste cost between 2025 and 2026"
+- "Which supplier has the highest associated waste cost?"
 - "Which category has the worst waste percentage?"
-
-Clicking a button pre-fills the question into the chat input and triggers the full answer pipeline.
 
 ---
 
