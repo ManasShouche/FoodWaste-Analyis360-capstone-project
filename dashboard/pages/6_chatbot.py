@@ -2,10 +2,11 @@
 Page 6 — AI Chatbot
 Architecture:
   User question
-    → Bedrock Nova Micro (Call 1: SQL generation)
+    → Athena information_schema (build live schema context)
+    → Bedrock Claude Haiku (Call 1: SQL generation)
     → SQL validator (blocks writes + SELECT *)
     → Athena (execute query, return DataFrame)
-    → Bedrock Nova Micro (Call 2: narrate result)
+    → Bedrock Claude Haiku (Call 2: narrate result)
     → Streamlit chat UI (NL answer + table + SQL expander)
 """
 
@@ -20,90 +21,173 @@ import streamlit as st
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from athena_conn import get_connection
+from chart_theme import apply_theme
 
 st.set_page_config(page_title="AI Chatbot", layout="wide")
 st.title("Ask Your Data")
-st.markdown("Ask plain-English questions about food waste. Powered by AWS Bedrock Nova Micro.")
+st.markdown("Ask plain-English questions about food waste. Powered by AWS Bedrock Claude Haiku.")
 
-AWS_REGION   = os.environ.get("AWS_REGION", "ap-south-1")
-ATHENA_DB    = os.environ.get("ATHENA_DATABASE", "food_waste_db")
-MAX_ROWS     = 50   # cap rows sent to Bedrock for narration
+AWS_REGION = os.environ.get("AWS_REGION", "ap-south-1")
+ATHENA_DB  = os.environ.get("ATHENA_DATABASE", "food_waste_db")
+MAX_ROWS   = 50
+MODEL_ID   = "apac.anthropic.claude-3-haiku-20240307-v1:0"
 
 # ---------------------------------------------------------------------------
-# Schema context injected into every SQL-gen prompt
+# Live schema pulled from Athena information_schema
 # ---------------------------------------------------------------------------
-SCHEMA_CONTEXT = """
-You are a SQL generator for a food waste analytics platform.
-Database: food_waste_db (AWS Athena / Presto SQL dialect)
+SCHEMA_NOTES = """
+Key constraints the model MUST respect:
+- fact_waste_summary has NO menu_sk, NO waste_reason_sk, NO supplier_sk, NO date_sk.
+  It is pre-aggregated by location + category. Filter category with: WHERE LOWER(fws.category) = 'snacks'
+  NEVER join fact_waste_summary to dim_menu or dim_supplier.
+- fact_production column is cost_per_unit (NOT unit_cost).
+- storage_rating in dim_location is a VARCHAR string ('A', 'B', 'C') — never compare as a number.
+- month_name only exists in dim_date. Fact tables only have month INT (1-12).
+  For month names convert to int: January=1, February=2, etc.
+- For supplier questions use fact_waste (has supplier_sk). Always add: WHERE ds.is_current = true
+- fact_waste_summary has NO supplier_sk — never join it to dim_supplier.
+"""
 
-Tables and columns:
-  fact_waste_summary(location_sk, menu_sk, waste_reason_sk, year INT, month INT,
-                     total_waste_quantity DOUBLE, total_waste_cost DOUBLE, avg_waste_percentage DOUBLE)
-  fact_waste(date_sk INT, location_sk, menu_sk, meal_period_sk, waste_reason_sk,
-             year INT, month INT, quantity_wasted DOUBLE, waste_cost DOUBLE, waste_percentage DOUBLE)
-  fact_production(date_sk INT, location_sk, menu_sk, meal_period_sk,
-                  year INT, month INT, quantity_prepared DOUBLE, unit_cost DOUBLE)
-  fact_consumption(date_sk INT, location_sk, menu_sk,
-                   year INT, month INT, quantity_consumed DOUBLE, demand_gap DOUBLE)
-  dim_location(location_sk, location_id, location_name, city, region, location_type,
-               capacity INT, storage_rating DOUBLE)
-  dim_menu(menu_sk, menu_item_id, menu_item_name, category, sub_category,
-           veg_flag BOOLEAN, shelf_life_hours INT, prep_complexity)
-  dim_date(date_sk INT, full_date, day_of_week INT, day_name, month INT,
-           month_name, quarter INT, year INT, is_weekend BOOLEAN)
-  dim_category(category_sk, category_name)
-  dim_meal_period(meal_period_sk, meal_period_name)
-  dim_waste_reason(waste_reason_sk, waste_reason_name)
-  dim_supplier(supplier_sk, supplier_id, supplier_name, lead_time_days INT,
-               quality_score DOUBLE, is_current BOOLEAN)
-
-Rules — ALWAYS follow these:
-- Return ONLY a valid Athena SQL query. Nothing else. No explanation. No markdown. No prose.
+RULES = """
+Rules — ALWAYS follow:
+- Return ONLY a valid Athena SQL query. No explanation, no markdown, no prose.
 - Always prefix table names with the database: food_waste_db.table_name
-- Only add year or month filters if the user explicitly mentions a specific year or month
-- If no time period is mentioned, query all years and months (no WHERE on year/month)
+- Only filter year/month if the user explicitly mentions a time period
 - Never use SELECT *
 - Use LIMIT 100 on all queries
-- Prefer fact_waste_summary over fact_waste for aggregated questions
-- Use LOWER() for string comparisons on category, location_name, region
-- For city/location questions, JOIN fact_waste_summary with dim_location on location_sk
+- Prefer fact_waste_summary for aggregated questions; use fact_waste for row-level detail
+- Use LOWER() for string comparisons on category, location_name, region, city
+"""
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching live schema from Athena...")
+def build_schema_context() -> str:
+    """Query information_schema.columns to get real column names for all food_waste_db tables."""
+    try:
+        conn = get_connection()
+        df = pd.read_sql(
+            f"""
+            SELECT table_name, column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = '{ATHENA_DB}'
+            ORDER BY table_name, ordinal_position
+            """,
+            conn,
+        )
+        if df.empty:
+            raise ValueError("information_schema returned no rows")
+
+        lines = [
+            "You are a SQL generator for a food waste analytics platform.",
+            f"Database: {ATHENA_DB} (AWS Athena / Presto SQL dialect)",
+            "",
+            "Tables and columns (pulled live from Athena information_schema):",
+        ]
+        for table, grp in df.groupby("table_name"):
+            cols = ", ".join(
+                f"{r['column_name']} {r['data_type'].upper()}"
+                for _, r in grp.iterrows()
+            )
+            lines.append(f"  {table}({cols})")
+
+        lines.append("")
+        lines.append(SCHEMA_NOTES)
+        lines.append(RULES)
+        return "\n".join(lines)
+
+    except Exception as e:
+        # Fallback to hardcoded schema if information_schema fails
+        st.warning(f"Could not fetch live schema ({e}) — using fallback schema.")
+        return _fallback_schema()
+
+
+def _fallback_schema() -> str:
+    return f"""
+You are a SQL generator for a food waste analytics platform.
+Database: {ATHENA_DB} (AWS Athena / Presto SQL dialect)
+
+Tables and columns:
+  fact_waste_summary(location_sk VARCHAR, category_sk VARCHAR, category VARCHAR,
+                     year INT, month INT, total_waste_quantity DOUBLE,
+                     total_waste_cost DOUBLE, avg_waste_percentage DOUBLE, waste_event_count BIGINT)
+  fact_waste(waste_sk VARCHAR, date_sk INT, location_sk VARCHAR, menu_sk VARCHAR,
+             meal_period_sk VARCHAR, waste_reason_sk VARCHAR, supplier_sk VARCHAR,
+             year INT, month INT, quantity_wasted DOUBLE, waste_cost DOUBLE, waste_percentage DOUBLE)
+  fact_production(production_sk VARCHAR, date_sk INT, location_sk VARCHAR, menu_sk VARCHAR,
+                  meal_period_sk VARCHAR, year INT, month INT,
+                  quantity_prepared DOUBLE, cost_per_unit DOUBLE, batch_id VARCHAR)
+  fact_consumption(consumption_sk VARCHAR, date_sk INT, location_sk VARCHAR, menu_sk VARCHAR,
+                   year INT, month INT, quantity_prepared DOUBLE, quantity_wasted DOUBLE,
+                   quantity_consumed DOUBLE, demand_gap DOUBLE)
+  dim_location(location_sk VARCHAR, location_id VARCHAR, location_name VARCHAR,
+               city VARCHAR, region VARCHAR, location_type VARCHAR,
+               capacity INT, storage_rating VARCHAR)
+  dim_menu(menu_sk VARCHAR, menu_item_id VARCHAR, menu_item_name VARCHAR,
+           category VARCHAR, sub_category VARCHAR, veg_flag VARCHAR,
+           shelf_life_hours INT, prep_complexity VARCHAR)
+  dim_date(date_sk INT, full_date VARCHAR, day_of_week INT, day_name VARCHAR,
+           month INT, month_name VARCHAR, quarter INT, year INT, is_weekend BOOLEAN)
+  dim_category(category_sk VARCHAR, category_name VARCHAR)
+  dim_meal_period(meal_period_sk VARCHAR, meal_period_name VARCHAR)
+  dim_waste_reason(waste_reason_sk VARCHAR, waste_reason_name VARCHAR)
+  dim_supplier(supplier_sk VARCHAR, supplier_id VARCHAR, supplier_name VARCHAR,
+               menu_item_id VARCHAR, lead_time_days INT, quality_score DOUBLE, is_current BOOLEAN)
+
+{SCHEMA_NOTES}
+{RULES}
+"""
+
+
+ROUTER_SYSTEM = """
+You are a food waste analytics assistant. Decide how to handle the user's message.
+
+Reply with EXACTLY one of these three formats — no other text:
+
+1. If the question needs data from the database to answer:
+   QUERY
+
+2. If the question is too vague and you need more context to write a useful query (e.g. "show me something", "what's interesting"):
+   CLARIFY: <one sentence asking for the specific detail you need>
+
+3. If the question can be answered from general knowledge without querying the database (e.g. "what is food waste?", "how does SCD2 work?", "what does waste percentage mean?"):
+   ANSWER: <your concise answer in 2-3 sentences>
 """
 
 NARRATION_SYSTEM = """
 You are a concise food waste analyst assistant.
-Given a user question and query results as JSON, write a 2-3 sentence plain-English answer.
-Highlight the most important number or finding. Do not repeat the question.
-Do not mention SQL. Be direct.
+Given a user question and query results as JSON, write 2-3 sentences in plain English.
+Highlight the most important number or finding. Do not repeat the question. Do not mention SQL.
 """
 
-
 # ---------------------------------------------------------------------------
-# Bedrock client
+# Bedrock — Claude Haiku
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def get_bedrock_client():
     return boto3.client("bedrock-runtime", region_name=AWS_REGION)
 
 
-def call_nova_micro(system_prompt: str, user_message: str) -> str:
+def call_claude(system_prompt: str, user_message: str) -> str:
     client = get_bedrock_client()
     body = {
-        "messages": [{"role": "user", "content": [{"text": user_message}]}],
-        "system": [{"text": system_prompt}],
-        "inferenceConfig": {"maxTokens": 512, "temperature": 0},
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 512,
+        "temperature": 0,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_message}],
     }
     response = client.invoke_model(
-        modelId="apac.amazon.nova-micro-v1:0",
+        modelId=MODEL_ID,
         body=json.dumps(body),
         contentType="application/json",
         accept="application/json",
     )
     result = json.loads(response["body"].read())
-    return result["output"]["message"]["content"][0]["text"].strip()
+    return result["content"][0]["text"].strip()
 
 
 # ---------------------------------------------------------------------------
-# SQL validator — hard block on writes and SELECT *
+# SQL validator
 # ---------------------------------------------------------------------------
 BLOCKED_PATTERNS = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|REPLACE|MERGE)\b",
@@ -113,7 +197,7 @@ BLOCKED_PATTERNS = re.compile(
 
 def validate_sql(sql: str) -> tuple[bool, str]:
     if BLOCKED_PATTERNS.search(sql):
-        return False, "Query contains a write operation (INSERT/DROP/etc.) — blocked."
+        return False, "Query contains a write operation — blocked."
     if re.search(r"SELECT\s+\*", sql, re.IGNORECASE):
         return False, "SELECT * is not allowed — blocked."
     if not re.search(r"\bSELECT\b", sql, re.IGNORECASE):
@@ -130,19 +214,16 @@ def run_athena_query(sql: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Auto-visualization — no extra Bedrock call, pure heuristics
+# Auto-visualization
 # ---------------------------------------------------------------------------
-# Columns that identify a "category" axis vs a surrogate key to skip
-_SK_COLS   = {"location_sk", "menu_sk", "date_sk", "meal_period_sk",
-              "waste_reason_sk", "category_sk", "supplier_sk"}
-_TIME_COLS = {"month", "year", "full_date", "period"}
+_SK_COLS    = {"location_sk", "menu_sk", "date_sk", "meal_period_sk",
+               "waste_reason_sk", "category_sk", "supplier_sk"}
 _LABEL_COLS = {"location_name", "menu_item_name", "category", "category_name",
                "waste_reason_name", "meal_period_name", "city", "region",
                "month_name", "day_name"}
 
 
 def auto_chart(df: pd.DataFrame) -> None:
-    """Render the most appropriate Plotly chart for a DataFrame, or nothing."""
     if df is None or df.empty or len(df) < 2:
         return
 
@@ -151,9 +232,8 @@ def auto_chart(df: pd.DataFrame) -> None:
     if not numeric_cols:
         return
 
-    primary_y = numeric_cols[0]   # first numeric col is the main metric
+    primary_y = numeric_cols[0]
 
-    # --- time-series: has month + year (or just month) ---
     if "month" in df.columns and len(df) <= 36:
         if "year" in df.columns:
             df = df.copy()
@@ -163,93 +243,100 @@ def auto_chart(df: pd.DataFrame) -> None:
             x_col = "period"
         else:
             x_col = "month"
-
         color_col = next((c for c in _LABEL_COLS if c in df.columns), None)
-        fig = px.line(
-            df.sort_values(x_col),
-            x=x_col, y=primary_y, color=color_col,
-            markers=True,
-            labels={primary_y: primary_y.replace("_", " ").title(), x_col: "Period"},
-            title=primary_y.replace("_", " ").title() + " Over Time",
-        )
+        fig = px.line(df.sort_values(x_col), x=x_col, y=primary_y, color=color_col,
+                      markers=True,
+                      labels={primary_y: primary_y.replace("_", " ").title(), x_col: "Period"},
+                      title=primary_y.replace("_", " ").title() + " Over Time")
+        apply_theme(fig)
         st.plotly_chart(fig, use_container_width=True)
         return
 
-    # --- categorical: has a label column ---
     label_col = next((c for c in _LABEL_COLS if c in df.columns), None)
     if label_col:
         top_n = df.nlargest(min(15, len(df)), primary_y)
-        fig = px.bar(
-            top_n.sort_values(primary_y),
-            x=primary_y, y=label_col,
-            orientation="h",
-            color=primary_y,
-            color_continuous_scale="Oranges",
-            labels={primary_y: primary_y.replace("_", " ").title(), label_col: ""},
-            title=primary_y.replace("_", " ").title() + " by " + label_col.replace("_", " ").title(),
-        )
-        fig.update_layout(coloraxis_showscale=False,
-                          yaxis={"categoryorder": "total ascending"})
+        fig = px.bar(top_n.sort_values(primary_y), x=primary_y, y=label_col,
+                     orientation="h", color=primary_y, color_continuous_scale="Oranges",
+                     labels={primary_y: primary_y.replace("_", " ").title(), label_col: ""},
+                     title=primary_y.replace("_", " ").title() + " by " + label_col.replace("_", " ").title())
+        fig.update_layout(coloraxis_showscale=False, yaxis={"categoryorder": "total ascending"})
+        apply_theme(fig)
         st.plotly_chart(fig, use_container_width=True)
         return
 
-    # --- two numeric cols: scatter ---
     if len(numeric_cols) >= 2:
-        fig = px.scatter(
-            df, x=numeric_cols[0], y=numeric_cols[1],
-            labels={numeric_cols[0]: numeric_cols[0].replace("_", " ").title(),
-                    numeric_cols[1]: numeric_cols[1].replace("_", " ").title()},
-            title=f"{numeric_cols[0].replace('_',' ').title()} vs "
-                  f"{numeric_cols[1].replace('_',' ').title()}",
-        )
+        fig = px.scatter(df, x=numeric_cols[0], y=numeric_cols[1],
+                         labels={numeric_cols[0]: numeric_cols[0].replace("_", " ").title(),
+                                 numeric_cols[1]: numeric_cols[1].replace("_", " ").title()},
+                         title=f"{numeric_cols[0].replace('_',' ').title()} vs "
+                               f"{numeric_cols[1].replace('_',' ').title()}")
+        apply_theme(fig)
         st.plotly_chart(fig, use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
 # Main chat logic
 # ---------------------------------------------------------------------------
-def answer_question(question: str) -> dict:
-    """
-    Returns dict with keys: sql, df, narration, error
-    """
-    # Call 1 — SQL generation
-    raw = call_nova_micro(
-        system_prompt=SCHEMA_CONTEXT,
-        user_message=question,
-    )
+def answer_question(question: str, schema_context: str, max_retries: int = 2) -> dict:
+    # Step 0 — route: does this need a DB query, a clarification, or a direct answer?
+    route_raw = call_claude(system_prompt=ROUTER_SYSTEM, user_message=question).strip()
 
+    if route_raw.startswith("CLARIFY:"):
+        clarification = route_raw[len("CLARIFY:"):].strip()
+        return {"sql": None, "df": None, "narration": clarification, "error": None, "type": "clarify"}
+
+    if route_raw.startswith("ANSWER:"):
+        direct_answer = route_raw[len("ANSWER:"):].strip()
+        return {"sql": None, "df": None, "narration": direct_answer, "error": None, "type": "answer"}
+
+    raw = call_claude(system_prompt=schema_context, user_message=question)
     sql = re.sub(r"```(?:sql)?", "", raw, flags=re.IGNORECASE).replace("```", "").strip()
 
     ok, err = validate_sql(sql)
     if not ok:
         return {"sql": sql, "df": None, "narration": None, "error": err}
 
-    try:
-        df = run_athena_query(sql)
-    except Exception as e:
-        return {"sql": sql, "df": None, "narration": None, "error": f"Athena error: {e}"}
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            df = run_athena_query(sql)
+            last_error = None
+            break
+        except Exception as e:
+            last_error = str(e)
+            if attempt < max_retries - 1:
+                fix_prompt = (
+                    f"The following SQL query failed on Athena with this error:\n\n"
+                    f"ERROR: {last_error}\n\n"
+                    f"FAILING SQL:\n{sql}\n\n"
+                    f"Original question: {question}\n\n"
+                    f"Fix the SQL so it runs correctly. Return ONLY the fixed SQL query."
+                )
+                raw = call_claude(system_prompt=schema_context, user_message=fix_prompt)
+                sql = re.sub(r"```(?:sql)?", "", raw, flags=re.IGNORECASE).replace("```", "").strip()
+
+    if last_error:
+        return {"sql": sql, "df": None, "narration": None, "error": f"Athena error (after {max_retries} attempts): {last_error}"}
 
     if df.empty:
         return {"sql": sql, "df": df, "narration": "No data found for that question.", "error": None}
 
-    # Call 2 — narrate result
     sample = df.head(MAX_ROWS).to_json(orient="records", date_format="iso")
-    narration_prompt = f"Question: {question}\n\nQuery results (JSON):\n{sample}"
-    narration = call_nova_micro(
+    narration = call_claude(
         system_prompt=NARRATION_SYSTEM,
-        user_message=narration_prompt,
+        user_message=f"Question: {question}\n\nQuery results (JSON):\n{sample}",
     )
-
     return {"sql": sql, "df": df, "narration": narration, "error": None}
 
 
 # ---------------------------------------------------------------------------
-# Streamlit chat UI
+# Streamlit UI
 # ---------------------------------------------------------------------------
+schema_context = build_schema_context()
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Render existing chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -260,37 +347,33 @@ for msg in st.session_state.messages:
             with st.expander("View generated SQL"):
                 st.code(msg["sql"], language="sql")
 
-# Suggested questions
 if not st.session_state.messages:
     st.markdown("**Try asking:**")
     cols = st.columns(3)
     suggestions = [
-        "Which location had the highest waste cost in 2026?",
+        "Which location had the highest waste cost in 2025?",
         "What are the top 5 menu items by waste quantity?",
         "Show monthly waste trend for 2025",
         "Which waste reason is most common?",
-        "Compare waste cost between 2025 and 2026",
+        "Which supplier has the highest associated waste cost?",
         "Which category has the worst waste percentage?",
     ]
     for i, s in enumerate(suggestions):
         if cols[i % 3].button(s, key=f"suggest_{i}"):
             st.session_state.pending_question = s
 
-# Handle suggested question click
 question = st.chat_input("Ask about food waste data...")
 if not question and "pending_question" in st.session_state:
     question = st.session_state.pop("pending_question")
 
 if question:
-    # Show user message
     with st.chat_message("user"):
         st.markdown(question)
     st.session_state.messages.append({"role": "user", "content": question})
 
-    # Get answer
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            result = answer_question(question)
+            result = answer_question(question, schema_context)
 
         if result["error"]:
             st.error(result["error"])
@@ -298,10 +381,8 @@ if question:
                 with st.expander("View generated SQL"):
                     st.code(result["sql"], language="sql")
             st.session_state.messages.append({
-                "role": "assistant",
-                "content": result["error"],
-                "sql": result.get("sql"),
-                "df": None,
+                "role": "assistant", "content": result["error"],
+                "sql": result.get("sql"), "df": None,
             })
         else:
             st.markdown(result["narration"])
@@ -311,8 +392,6 @@ if question:
             with st.expander("View generated SQL"):
                 st.code(result["sql"], language="sql")
             st.session_state.messages.append({
-                "role": "assistant",
-                "content": result["narration"],
-                "sql": result["sql"],
-                "df": result["df"],
+                "role": "assistant", "content": result["narration"],
+                "sql": result["sql"], "df": result["df"],
             })
