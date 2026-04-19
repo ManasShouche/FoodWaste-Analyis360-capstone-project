@@ -21,10 +21,10 @@ RECOMMENDATIONS = {
 }
 
 ROOT_CAUSE_COLORS = {
-    "Overproduction":     "background-color: #ef9a9a; color: #7f0000",   # bold red
-    "Storage / Spoilage": "background-color: #ffcc80; color: #7f3100",   # amber
-    "Portion Mismatch":   "background-color: #fff176; color: #5f4c00",   # yellow
-    "Low Demand":         "background-color: #b0bec5; color: #1a2b33",   # slate blue-grey
+    "Overproduction":     "background-color: #FFCCBC; color: #BF360C",   # soft terracotta
+    "Storage / Spoilage": "background-color: #FFE0B2; color: #E65100",   # warm peach
+    "Portion Mismatch":   "background-color: #FFF9C4; color: #F57F17",   # warm cream yellow
+    "Low Demand":         "background-color: #F5F5F5; color: #5D4037",   # warm off-white/brown
 }
 
 

@@ -141,16 +141,15 @@ Tables and columns:
 ROUTER_SYSTEM = """
 You are a food waste analytics assistant. Decide how to handle the user's message.
 
-Reply with EXACTLY one of these three formats — no other text:
+Reply with EXACTLY one of these two formats — no other text:
 
-1. If the question needs data from the database to answer:
+1. If the question could involve any data (locations, cities, categories, waste, cost, suppliers, trends, rankings, comparisons, months, years) — always choose this:
    QUERY
 
-2. If the question is too vague and you need more context to write a useful query (e.g. "show me something", "what's interesting"):
-   CLARIFY: <one sentence asking for the specific detail you need>
-
-3. If the question can be answered from general knowledge without querying the database (e.g. "what is food waste?", "how does SCD2 work?", "what does waste percentage mean?"):
+2. Only if the question is purely about definitions or concepts with zero data involved (e.g. "what is SCD2?", "what does waste percentage mean?", "how does the pipeline work?"):
    ANSWER: <your concise answer in 2-3 sentences>
+
+When in doubt, choose QUERY.
 """
 
 NARRATION_SYSTEM = """
@@ -174,7 +173,7 @@ def call_claude(system_prompt: str, user_message: str) -> str:
         "max_tokens": 512,
         "temperature": 0,
         "system": system_prompt,
-        "messages": [{"role": "user", "content": user_message}],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": user_message}]}],
     }
     response = client.invoke_model(
         modelId=MODEL_ID,
@@ -281,10 +280,6 @@ def answer_question(question: str, schema_context: str, max_retries: int = 2) ->
     # Step 0 — route: does this need a DB query, a clarification, or a direct answer?
     route_raw = call_claude(system_prompt=ROUTER_SYSTEM, user_message=question).strip()
 
-    if route_raw.startswith("CLARIFY:"):
-        clarification = route_raw[len("CLARIFY:"):].strip()
-        return {"sql": None, "df": None, "narration": clarification, "error": None, "type": "clarify"}
-
     if route_raw.startswith("ANSWER:"):
         direct_answer = route_raw[len("ANSWER:"):].strip()
         return {"sql": None, "df": None, "narration": direct_answer, "error": None, "type": "answer"}
@@ -316,7 +311,15 @@ def answer_question(question: str, schema_context: str, max_retries: int = 2) ->
                 sql = re.sub(r"```(?:sql)?", "", raw, flags=re.IGNORECASE).replace("```", "").strip()
 
     if last_error:
-        return {"sql": sql, "df": None, "narration": None, "error": f"Athena error (after {max_retries} attempts): {last_error}"}
+        clarify = call_claude(
+            system_prompt="You are a food waste analytics assistant.",
+            user_message=(
+                f"The question '{question}' failed to produce a working SQL query after {max_retries} attempts. "
+                f"Last error: {last_error}. "
+                f"Ask the user one short clarifying question to help you answer correctly."
+            ),
+        )
+        return {"sql": sql, "df": None, "narration": clarify, "error": None, "type": "clarify"}
 
     if df.empty:
         return {"sql": sql, "df": df, "narration": "No data found for that question.", "error": None}
