@@ -13,11 +13,18 @@ st.set_page_config(page_title="Root Cause", layout="wide")
 st.title("Root Cause Analysis")
 st.markdown("Waste classified by root cause with actionable recommendations.")
 
+RECOMMENDATIONS = {
+    "Overproduction":     "Cut prep volume by 25% — you're cooking more than guests eat.",
+    "Storage / Spoilage": "Fix fridge timing or push supplier to deliver closer to service.",
+    "Portion Mismatch":   "Shrink the default portion — most guests won't ask for more.",
+    "Low Demand":         "Pull this item on slow days or swap it for something that moves.",
+}
+
 ROOT_CAUSE_COLORS = {
-    "Overproduction":    "background-color: #ffcccc",   # red
-    "Storage / Spoilage": "background-color: #ffe0b2",  # orange
-    "Portion Mismatch":  "background-color: #fff9c4",   # yellow
-    "Low Demand":        "background-color: #e0e0e0",   # grey
+    "Overproduction":     "background-color: #ef9a9a; color: #7f0000",   # bold red
+    "Storage / Spoilage": "background-color: #ffcc80; color: #7f3100",   # amber
+    "Portion Mismatch":   "background-color: #fff176; color: #5f4c00",   # yellow
+    "Low Demand":         "background-color: #b0bec5; color: #1a2b33",   # slate blue-grey
 }
 
 
@@ -76,6 +83,10 @@ with st.spinner("Loading root cause data..."):
                 filtered = filtered[filtered["location_name"] == selected_loc]
             if selected_cause != "All":
                 filtered = filtered[filtered["root_cause"] == selected_cause]
+
+            # Override recommendations with plain-English versions
+            filtered = filtered.copy()
+            filtered["recommendation"] = filtered["root_cause"].map(RECOMMENDATIONS).fillna(filtered["recommendation"])
 
             # Styled table
             display = filtered[[

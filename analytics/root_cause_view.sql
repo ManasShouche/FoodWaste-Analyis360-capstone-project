@@ -53,18 +53,18 @@ SELECT
     CASE
         WHEN fws.avg_waste_percentage > 40
              AND (fws.total_waste_quantity / NULLIF(fws.waste_event_count, 0)) > 5
-            THEN 'Reduce batch size by 20-30% for this category at this location.'
+            THEN 'You are cooking way more than guests are eating. Cut prep volume by 25% for the next 2 weeks and track whether plates run out — if they don''t, lock in the lower batch size permanently.'
 
         WHEN fws.category IN ('SALADS', 'DAIRY', 'FRESH JUICE', 'FRUITS',
                               'Salads', 'Dairy', 'Fresh Juice', 'Fruits')
              AND fws.avg_waste_percentage > 20
-            THEN 'Review storage conditions and supplier lead time.'
+            THEN 'This is a fridge or timing problem, not a demand problem. Check how long items sit before service and when the supplier delivers — if it''s arriving less than 12 hours before a meal, push for an earlier drop.'
 
         WHEN fws.avg_waste_percentage > 30
              AND (fws.total_waste_quantity / NULLIF(fws.waste_event_count, 0)) <= 5
-            THEN 'Adjust portion sizes for this menu item.'
+            THEN 'Portions are too generous for what guests actually want. Try a smaller default serving and let guests ask for more — most won''t, and waste will drop fast.'
 
-        ELSE 'Review menu item demand — consider removal or rotation.'
+        ELSE 'Guests are consistently skipping this item. Either pull it from the menu on low-traffic days or swap it out for something in the same category that actually moves.'
     END AS recommendation
 
 FROM food_waste_db.fact_waste_summary fws
