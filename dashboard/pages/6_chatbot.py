@@ -335,7 +335,9 @@ def answer_question(question: str, schema_context: str, max_retries: int = 2) ->
 # ---------------------------------------------------------------------------
 # Streamlit UI
 # ---------------------------------------------------------------------------
-schema_context = build_schema_context()
+if "schema_context" not in st.session_state:
+    st.session_state.schema_context = build_schema_context()
+schema_context = st.session_state.schema_context
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
